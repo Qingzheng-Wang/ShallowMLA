@@ -1,9 +1,9 @@
 import torch
 import math
+import torch.nn as nn
+import torch.nn.functional as F
 
-from torch import nn
 from typing import Optional
-from torch.nn import functional as F
 
 
 def precompute_freqs_cis(
@@ -273,6 +273,7 @@ class Layer(nn.Module):
         # use prenorm
         x = x + self.mla(self.mla_norm(x), start_pos, freq_cis, mask)
         x = x + self.ffn(self.ffn_norm(x))
+        return x
 
 class Transformer(nn.Module):
     def __init__(
@@ -322,7 +323,7 @@ class Transformer(nn.Module):
         freq_cis = self.freq_cis[start_pos:end_pos]
         mask = None
         if seq_len > 1:
-            mask = torch.full((seq_len, seq_len), float("-inf"), device=tokens.device).triu_(1)
+            mask = torch.full((seq_len, start_pos + seq_len), float("-inf"), device=tokens.device).triu_(1)
         
         for layer in self.layers:
             x = layer(x, start_pos, freq_cis, mask)
@@ -331,4 +332,50 @@ class Transformer(nn.Module):
         logits = self.final_proj(x)
         return logits
 
+if __name__ == "__main__":
+    torch.manual_seed(42)
+
+    dim = 64
+    kv_latent_rank = 32
+    q_latent_rank = 32
+    num_heads = 4
+    qk_nrope_head_dim = 24
+    v_head_dim = 16
+    qk_rope_head_dim = 40
+    max_batch_size = 2
+    max_seq_len = 16
+    max_seq_len_train = 8
+    ffn_hidden_dim = 128
+    num_layers = 2
+    vocab_size = 100
+
+    model = Transformer(
+        dim=dim,
+        kv_latent_rank=kv_latent_rank,
+        q_latent_rank=q_latent_rank,
+        num_heads=num_heads,
+        qk_nrope_head_dim=qk_nrope_head_dim,
+        v_head_dim=v_head_dim,
+        qk_rope_head_dim=qk_rope_head_dim,
+        max_batch_size=max_batch_size,
+        max_seq_len=max_seq_len,
+        max_seq_len_train=max_seq_len_train,
+        ffn_hidden_dim=ffn_hidden_dim,
+        num_layers=num_layers,
+        vocab_size=vocab_size
+    )
+
+    model.eval()
+    batch_size = 2
+    seq_len = 5
+    tokens = torch.randint(0, vocab_size, (batch_size, seq_len))
+    print(f"Tokens shape: {tokens.shape}")
+
+    with torch.no_grad():
+        logits = model(tokens, start_pos=0)
+
+    print("Input shape:", tokens.shape)               # [2, 5]
+    print("Logits shape:", logits.shape)              # [2, vocab_size]
+    assert logits.shape == (batch_size, vocab_size), "Output shape mismatch"
+    print("Test passed.")
 
