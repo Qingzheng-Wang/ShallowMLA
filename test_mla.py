@@ -1,6 +1,7 @@
 import torch
 from mla import Transformer, precompute_freqs_cis, apply_rotary_emb, MLATorch
 import time
+import torch.profiler as profiler
 
 
 def test_transformer_forward():
@@ -156,8 +157,8 @@ def benchmark_mla():
         max_seq_len=max_seq_len,
     ).to(device)
 
-    batch_size = 1
-    seq_len = 4096 * 2
+    batch_size = 8
+    seq_len = 1024
     x = torch.randn(batch_size, seq_len, dim).to(device)
 
     start_pos = 0
@@ -175,10 +176,24 @@ def benchmark_mla():
     torch.cuda.synchronize() if device == "cuda" else None
     start = time.time()
 
-    for _ in range(10):
-        _ = mla(x, start_pos, freq_cis, mask)
+    # torch profiler benchmark
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        schedule=torch.profiler.schedule(wait=1, warmup=1, active=3),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler("./log_dir"),
+        record_shapes=True,
+        with_stack=True
+    ) as prof:
+        for _ in range(5):
+            _ = mla(x, start_pos, freq_cis, mask)
+            prof.step()
 
     torch.cuda.synchronize() if device == "cuda" else None
+
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
     end = time.time()
 
     avg_time = (end - start) / 10
