@@ -189,7 +189,7 @@ def benchmark_mla():
 
     # warmup
     for _ in range(5):
-        _ = mla(x, start_pos, freq_cis, mask)
+        _ = mla_torch(x, start_pos, freq_cis, mask)
 
     torch.cuda.synchronize() if device == "cuda" else None
     start = time.time()
@@ -207,17 +207,51 @@ def benchmark_mla():
         profile_memory=True
     ) as prof:
         for _ in range(5):
-            _ = mla(x, start_pos, freq_cis, mask)
+            _ = mla_torch(x, start_pos, freq_cis, mask)
             prof.step()
 
     torch.cuda.synchronize() if device == "cuda" else None
 
+    print("MLA Torch Profiler Results:")
     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
     end = time.time()
+    avg_time_torch = (end - start) / 10
 
-    avg_time = (end - start) / 10
-    print(f"MLA forward average time: {avg_time:.4f} seconds")
-    print(f"Throughput: {(batch_size * seq_len) / avg_time:.2f} tokens/sec")
+    # warmup
+    for _ in range(5):
+        _ = mla_triton(x, start_pos, freq_cis, mask)
+
+    torch.cuda.synchronize() if device == "cuda" else None
+    start = time.time()
+
+    # torch profiler benchmark
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        schedule=torch.profiler.schedule(wait=1, warmup=1, active=3),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler("./log_dir_fix"),
+        record_shapes=True,
+        with_stack=True,
+        profile_memory=True
+    ) as prof:
+        for _ in range(5):
+            _ = mla_triton(x, start_pos, freq_cis, mask)
+            prof.step()
+
+    torch.cuda.synchronize() if device == "cuda" else None
+
+    print("MLA Triton Profiler Results:")
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
+    end = time.time()
+    avg_time_triton = (end - start) / 10
+
+
+    print(f"MLA Torch forward average time: {avg_time_torch:.4f} seconds")
+    print(f"MLA Triton forward average time: {avg_time_triton:.4f} seconds")
+    print(f"Throughput Torch: {(batch_size * seq_len) / avg_time_torch:.2f} tokens/sec")
+    print(f"Throughput Triton: {(batch_size * seq_len) / avg_time_triton:.2f} tokens/sec")
 
 def test_mla_triton():
 
@@ -316,6 +350,6 @@ if __name__ == "__main__":
     # test_transformer_forward()
     # test_continuous_inference()
     # test_rope_interpolation()
-    # benchmark_mla()
-    test_mla_triton()
+    benchmark_mla()
+    # test_mla_triton()
     # test_fused_qk_attention()
