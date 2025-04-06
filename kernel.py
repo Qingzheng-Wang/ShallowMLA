@@ -91,7 +91,7 @@ def fused_qk_attention_kernel(
             mask_r = r_off + offs_r < R
             q_rope = tl.load(
                 q_rope_ptr + 
-                pid_b + stride_qr_b + 
+                pid_b * stride_qr_b + 
                 offs_l[:, None] * stride_qr_l + 
                 h * stride_qr_h + 
                 (r_off + offs_r)[None, :] * stride_qr_r,
@@ -127,6 +127,11 @@ def fused_qk_attention(
     k_rope_cache: torch.Tensor,
     softmax_scale: float,
 ): 
+    print("q_nrope_absorb:", q_nrope_absorb.shape, q_nrope_absorb.dtype)
+    print("q_rope:", q_rope.shape, q_rope.dtype)
+    print("kv_latent_cache:", kv_latent_cache.shape, kv_latent_cache.dtype)
+    print("k_rope_cache:", k_rope_cache.shape, k_rope_cache.dtype)
+
     B, L, H, K = q_nrope_absorb.shape
     _, T, R = k_rope_cache.shape
     out = torch.empty((B, L, H, T), dtype=q_nrope_absorb.dtype, device=q_nrope_absorb.device)
@@ -150,10 +155,10 @@ def fused_qk_attention(
         *k_rope_cache.stride(),
         *out.stride(),
         softmax_scale,
-        BLOCK_L=64,
-        BLOCK_T=64,
-        BLOCK_K=64,
-        BLOCK_R=64,
+        BLOCK_L=32,
+        BLOCK_T=32,
+        BLOCK_K=32,
+        BLOCK_R=32,
     )
 
     return out

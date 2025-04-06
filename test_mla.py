@@ -1,7 +1,11 @@
 import torch
-from mla import Transformer, precompute_freqs_cis, apply_rotary_emb, MLATorch
+from mla import (
+    Transformer, precompute_freqs_cis, 
+    apply_rotary_emb, MLATorch, MLATriton
+)
 import time
 import torch.profiler as profiler
+from kernel import fused_qk_attention
 
 
 def test_transformer_forward():
@@ -145,7 +149,7 @@ def benchmark_mla():
     max_batch_size = 8
     max_seq_len = 4096 * 4
 
-    mla = MLATorch(
+    mla_torch = MLATorch(
         dim=dim,
         kv_latent_rank=kv_latent_rank,
         q_latent_rank=q_latent_rank,
@@ -156,6 +160,20 @@ def benchmark_mla():
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
     ).to(device)
+
+    mla_triton = MLATriton(
+        dim=dim,
+        kv_latent_rank=kv_latent_rank,
+        q_latent_rank=q_latent_rank,
+        num_heads=num_heads,
+        qk_nrope_head_dim=qk_nrope_head_dim,
+        v_head_dim=v_head_dim,
+        qk_rope_head_dim=qk_rope_head_dim,
+        max_batch_size=max_batch_size,
+        max_seq_len=max_seq_len,
+    ).to(device)
+
+    mla_triton.load_state_dict(mla_torch.state_dict()) # ensure weights are the same
 
     batch_size = 8
     seq_len = 1024
@@ -183,9 +201,10 @@ def benchmark_mla():
             torch.profiler.ProfilerActivity.CUDA,
         ],
         schedule=torch.profiler.schedule(wait=1, warmup=1, active=3),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler("./log_dir"),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler("./log_dir_fix"),
         record_shapes=True,
-        with_stack=True
+        with_stack=True,
+        profile_memory=True
     ) as prof:
         for _ in range(5):
             _ = mla(x, start_pos, freq_cis, mask)
@@ -200,8 +219,103 @@ def benchmark_mla():
     print(f"MLA forward average time: {avg_time:.4f} seconds")
     print(f"Throughput: {(batch_size * seq_len) / avg_time:.2f} tokens/sec")
 
+def test_mla_triton():
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Running on {device}")
+
+    torch.manual_seed(42)
+
+    dim = 2048
+    num_heads = 16
+    kv_latent_rank = 512
+    q_latent_rank = 512
+    qk_nrope_head_dim = 128
+    qk_rope_head_dim = 64
+    v_head_dim = 128
+    max_batch_size = 8
+    max_seq_len = 4096 * 4
+
+    mla_torch = MLATorch(
+        dim=dim,
+        kv_latent_rank=kv_latent_rank,
+        q_latent_rank=q_latent_rank,
+        num_heads=num_heads,
+        qk_nrope_head_dim=qk_nrope_head_dim,
+        v_head_dim=v_head_dim,
+        qk_rope_head_dim=qk_rope_head_dim,
+        max_batch_size=max_batch_size,
+        max_seq_len=max_seq_len,
+    ).to(device)
+
+    mla_triton = MLATriton(
+        dim=dim,
+        kv_latent_rank=kv_latent_rank,
+        q_latent_rank=q_latent_rank,
+        num_heads=num_heads,
+        qk_nrope_head_dim=qk_nrope_head_dim,
+        v_head_dim=v_head_dim,
+        qk_rope_head_dim=qk_rope_head_dim,
+        max_batch_size=max_batch_size,
+        max_seq_len=max_seq_len,
+    ).to(device)
+
+    mla_triton.load_state_dict(mla_torch.state_dict())
+
+    batch_size = 8
+    seq_len = 1024
+    x = torch.randn(batch_size, seq_len, dim, dtype=torch.float32).to(device)
+
+    start_pos = 0
+    freq_cis = precompute_freqs_cis(
+        qk_rope_head_dim, max_seq_len, seq_len, beta_fast=32, beta_slow=1,
+        rope_theta=10000.0, rope_factor=40.0
+    ).to(device)[start_pos: start_pos + seq_len]
+
+    mask = torch.full((seq_len, seq_len), float("-inf"), device=device).triu_(1)
+
+    result_torch = mla_torch(x, start_pos, freq_cis, mask)
+    result_triton = mla_triton(x, start_pos, freq_cis, mask)
+
+    diff = torch.norm(result_torch - result_triton).item()
+    if diff < 1e-4:
+        print("✅ Triton and Torch results match.")
+    else:
+        print(f"❌ Triton and Torch results differ: {diff:.6f}")
+
+def test_fused_qk_attention():
+
+    B = 8         # batch size
+    L = 1024      # query len
+    T = 1024      # key len
+    H = 16        # num heads
+    K = 512       # latent rank
+    R = 64        # rope dim
+    softmax_scale = 1.0 / (K + R) ** 0.5  # match with model
+
+    q_nrope_absorb = torch.randn(B, L, H, K, dtype=torch.float32, device='cuda')
+    q_rope = torch.randn(B, L, H, R, dtype=torch.float32, device='cuda')
+    kv_latent_cache = torch.randn(B, T, K, dtype=torch.float32, device='cuda')
+    k_rope_cache = torch.randn(B, T, R, dtype=torch.float32, device='cuda')
+
+    scores_torch = (
+        torch.einsum("blhk,btk->blht", q_nrope_absorb, kv_latent_cache) +
+        torch.einsum("blhr,btr->blht", q_rope, k_rope_cache)
+    ) * softmax_scale
+
+    scores_triton = fused_qk_attention(
+        q_nrope_absorb, q_rope, kv_latent_cache, k_rope_cache, softmax_scale
+    )
+
+    print("Max abs diff:", (scores_torch - scores_triton).abs().max().item())
+    print("Mean diff:", (scores_torch - scores_triton).abs().mean().item())
+    print("Scores equal:", torch.allclose(scores_torch, scores_triton, rtol=1e-3, atol=1e-3))
+
+
 if __name__ == "__main__":
     # test_transformer_forward()
     # test_continuous_inference()
     # test_rope_interpolation()
-    benchmark_mla()
+    # benchmark_mla()
+    test_mla_triton()
+    # test_fused_qk_attention()
