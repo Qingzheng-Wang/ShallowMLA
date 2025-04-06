@@ -127,10 +127,6 @@ def fused_qk_attention(
     k_rope_cache: torch.Tensor,
     softmax_scale: float,
 ): 
-    print("q_nrope_absorb:", q_nrope_absorb.shape, q_nrope_absorb.dtype)
-    print("q_rope:", q_rope.shape, q_rope.dtype)
-    print("kv_latent_cache:", kv_latent_cache.shape, kv_latent_cache.dtype)
-    print("k_rope_cache:", k_rope_cache.shape, k_rope_cache.dtype)
 
     B, L, H, K = q_nrope_absorb.shape
     _, T, R = k_rope_cache.shape
