@@ -70,6 +70,7 @@ def fused_qk_attention_kernel(
     BLOCK_T: tl.constexpr, # block size for seq_len_k
     BLOCK_K: tl.constexpr, # block size for kv_latent_rank
     BLOCK_R: tl.constexpr, # block size for qk_rope_head_dim
+    dtype: tl.constexpr,
 ):
     """
     This kernel focuses on the QK^T in the MLA.
@@ -112,7 +113,7 @@ def fused_qk_attention_kernel(
     mask_t = offs_t < T
 
     for h in range(H):
-        accumulator = tl.zeros((BLOCK_L, BLOCK_T), dtype=tl.float32)
+        accumulator = tl.zeros((BLOCK_L, BLOCK_T), dtype=dtype)
 
         # q_nrope_absorb kv_latent_cache
         for k_off in range(0, K, BLOCK_K):
@@ -202,6 +203,7 @@ def fused_qk_attention_kernel_2(
     BLOCK_T: tl.constexpr, # block size for seq_len_k
     BLOCK_K: tl.constexpr, # block size for kv_latent_rank
     BLOCK_R: tl.constexpr, # block size for qk_rope_head_dim
+    dtype: tl.constexpr,
 ):
     """
     Version 2 of the fused qk attention kernel.
@@ -249,7 +251,7 @@ def fused_qk_attention_kernel_2(
     mask_l = offs_l < L
     mask_t = offs_t < T
 
-    accumulator = tl.zeros((BLOCK_L, BLOCK_T), dtype=tl.float32)
+    accumulator = tl.zeros((BLOCK_L, BLOCK_T), dtype=dtype)
 
     # q_nrope_absorb kv_latent_cache
     for k_off in range(0, K, BLOCK_K):
@@ -313,6 +315,7 @@ def fused_qk_attention(
     k_rope_cache: torch.Tensor,
     softmax_scale: float,
     kernel_version: int = 1,
+    dtype: tl.constexpr = tl.float32,
 ): 
 
     B, L, H, K = q_nrope_absorb.shape
@@ -351,6 +354,7 @@ def fused_qk_attention(
         # BLOCK_T=32,
         # BLOCK_K=32,
         # BLOCK_R=32,
+        dtype=dtype,
     ) # the block sizes is tuned by autotune
 
     return out

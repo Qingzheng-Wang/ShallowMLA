@@ -266,7 +266,7 @@ def benchmark_mla(batch_size=8, seq_len=1024, use_profile=False, dtype=torch.flo
     freq_cis = precompute_freqs_cis(
         qk_rope_head_dim, max_seq_len, seq_len, beta_fast=32, beta_slow=1,
         rope_theta=10000.0, rope_factor=40.0
-    ).to(device)[start_pos: start_pos + seq_len].to(dtype)
+    ).to(device)[start_pos: start_pos + seq_len]
 
     mask = torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=dtype).triu_(1)
 
@@ -381,7 +381,8 @@ def benchmark():
             ) = benchmark_mla(
                 batch_size=batch_size, 
                 seq_len=seq_len, 
-                use_profile=False
+                use_profile=False, 
+                dtype=torch.float32 # FLOAT16 IS BUG!!!!!!!!!!!!
             )
             results[(batch_size, seq_len)] = (
                 avg_time_torch, 

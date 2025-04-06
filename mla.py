@@ -2,6 +2,7 @@ import torch
 import math
 import torch.nn as nn
 import torch.nn.functional as F
+import triton.language as tl
 
 from typing import Optional
 from kernel import fused_qk_attention
@@ -14,7 +15,8 @@ def precompute_freqs_cis(
     beta_fast: int, 
     beta_slow: int, 
     rope_theta: float, 
-    rope_factor: float
+    rope_factor: float,
+    dtype: Optional[torch.dtype] = torch.float16
 ) -> torch.Tensor:
     """
     This function is adapted from 
@@ -81,12 +83,12 @@ def precompute_freqs_cis(
         """
         if min == max:
             max += 0.001
-        linear_func = (torch.arange(dim, dtype=torch.float32) - min) / (max - min)
+        linear_func = (torch.arange(dim) - min) / (max - min)
         ramp_func = torch.clamp(linear_func, 0, 1)
         return ramp_func
 
     # theta_i = 1 / (rope_theta ^ (2i / d)) i in {0, 2, ... d - 2}
-    freqs = 1.0 / (rope_theta ** (torch.arange(0, qk_rope_head_dim, 2, dtype=torch.float32) / qk_rope_head_dim))
+    freqs = 1.0 / (rope_theta ** (torch.arange(0, qk_rope_head_dim, 2) / qk_rope_head_dim))
     if seq_len > seq_len_train: # if inference seq_len > seq_len_train
         low, high = find_correction_range(beta_fast, beta_slow, qk_rope_head_dim, rope_theta, seq_len_train)
         smooth = 1 - linear_ramp_factor(low, high, qk_rope_head_dim // 2)
@@ -95,7 +97,7 @@ def precompute_freqs_cis(
     t = torch.arange(seq_len)
     freqs = torch.outer(t, freqs) # outer product, freqs[t, i] = theta_i * t
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs) # exp(j * theta_i * t)
-    return freqs_cis
+    return torch.view_as_real(freqs_cis).to(dtype) # [..., 2], 0 for real, 1 for imag
 
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
@@ -110,10 +112,19 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
         torch.Tensor: Tensor with rotary embeddings applied.
     """
     dtype = x.dtype
-    x = torch.view_as_complex(x.float().view(*x.shape[:-1], -1, 2))
-    freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
-    y = torch.view_as_real(x * freqs_cis).flatten(3)
-    return y.to(dtype)
+    x = x.view(*x.shape[:-1], -1, 2)
+    x_real = x[..., 0]
+    x_imag = x[..., 1]
+    freqs_cos = freqs_cis[:, :, 0].unsqueeze(0).unsqueeze(2)
+    freqs_sin = freqs_cis[:, :, 1].unsqueeze(0).unsqueeze(2)
+
+    out_real = x_real * freqs_cos - x_imag * freqs_sin
+    out_imag = x_real * freqs_sin + x_imag * freqs_cos
+    out = torch.stack([out_real, out_imag], dim=-1).flatten(3)  # [B, L, H, D]
+
+    assert out.dtype == dtype, f"Output dtype {out.dtype} does not match input dtype {dtype}"
+    return out
+    
 
 
 class MLA(nn.Module):
@@ -219,10 +230,11 @@ class MLA(nn.Module):
                 )
             ) * self.softmax_scale # [batch_size, seq_len_q, num_heads, seq_len_k]
         elif self.optim_type == "triton":
+            kernel_dtype = tl.float16 if x.dtype == torch.float16 else tl.float32
             scores = fused_qk_attention(
                 q_nrope_absorb, q_rope, 
                 self.kv_latent_cache[:batch_size, :end_pos], self.k_rope_cache[:batch_size, :end_pos],
-                self.softmax_scale, kernel_version=2
+                self.softmax_scale, kernel_version=2, dtype=kernel_dtype
             )
 
         # mask the scores
