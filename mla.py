@@ -116,7 +116,7 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     return y.to(dtype)
 
 
-class MLATorch(nn.Module):
+class MLA(nn.Module):
     def __init__(
         self,
         dim: int, # model dim
@@ -128,19 +128,21 @@ class MLATorch(nn.Module):
         qk_rope_head_dim: int, # dim of the q and k rotary embeddings
         max_batch_size: int, # max batch size
         max_seq_len: int, # max sequence length
+        dtype: Optional[torch.dtype] = torch.float16, # the dtype of the model
+        optim_type: str = "torch", # the type of the optimization, "torch" or "triton"
     ):
         super().__init__()
         self.qk_head_dim = qk_nrope_head_dim + qk_rope_head_dim
 
-        self.proj_kv_down = nn.Linear(dim, kv_latent_rank + qk_rope_head_dim, bias=False)
-        self.rms_norm_kv = nn.RMSNorm(kv_latent_rank)
-        self.proj_kv_up = nn.Linear(kv_latent_rank, num_heads * (qk_nrope_head_dim + v_head_dim), bias=False)
+        self.proj_kv_down = nn.Linear(dim, kv_latent_rank + qk_rope_head_dim, bias=False, dtype=dtype)
+        self.rms_norm_kv = nn.RMSNorm(kv_latent_rank, dtype=dtype)
+        self.proj_kv_up = nn.Linear(kv_latent_rank, num_heads * (qk_nrope_head_dim + v_head_dim), bias=False, dtype=dtype)
 
-        self.proj_q_down = nn.Linear(dim, q_latent_rank, bias=False)
-        self.rms_norm_q = nn.RMSNorm(q_latent_rank)
-        self.proj_q_up = nn.Linear(q_latent_rank, num_heads * self.qk_head_dim, bias=False)
+        self.proj_q_down = nn.Linear(dim, q_latent_rank, bias=False, dtype=dtype)
+        self.rms_norm_q = nn.RMSNorm(q_latent_rank, dtype=dtype)
+        self.proj_q_up = nn.Linear(q_latent_rank, num_heads * self.qk_head_dim, bias=False, dtype=dtype)
 
-        self.proj_out = nn.Linear(num_heads * v_head_dim, dim, bias=False)
+        self.proj_out = nn.Linear(num_heads * v_head_dim, dim, bias=False, dtype=dtype)
 
         self.softmax_scale = 1.0 / self.qk_head_dim ** 0.5
         self.num_heads = num_heads
@@ -150,14 +152,16 @@ class MLATorch(nn.Module):
         self.qk_nrope_head_dim = qk_nrope_head_dim
         self.v_head_dim = v_head_dim
 
+        self.optim_type = optim_type
+
         self.register_buffer(
             "kv_latent_cache", 
-            torch.zeros(max_batch_size, max_seq_len, kv_latent_rank), 
+            torch.zeros(max_batch_size, max_seq_len, kv_latent_rank, dtype=dtype), 
             persistent=False # the buffer will not be saved in the state dict
         )
         self.register_buffer(
             "k_rope_cache", 
-            torch.zeros(max_batch_size, max_seq_len, qk_rope_head_dim),
+            torch.zeros(max_batch_size, max_seq_len, qk_rope_head_dim, dtype=dtype),
             persistent=False
         )
     
@@ -196,129 +200,30 @@ class MLATorch(nn.Module):
         # q_nrope absorb the kv_up weight, make q_nrope could directly matmul with kv_latent, 
         # and kv_latent can be directly get from the cache
         proj_kv_up_weight_q_nrope_absorbed = proj_kv_up_weight[:, :self.qk_nrope_head_dim, :]
+        """
+        The motivation of first aborbing the kv_up weight into q_nrope: 
+        1. If first upsample the kv_latent, then will cause large k, k is with 
+        higher dimension than kv_latent, which causes higher memory usage.
+        """
         q_nrope_absorb = torch.einsum(
             "blhd,hdk->blhk", q_nrope, proj_kv_up_weight_q_nrope_absorbed
         ) # [batch_size, seq_len, num_heads, kv_latent_rank]
-        scores = (
-            torch.einsum(
-                "blhk,btk->blht", q_nrope_absorb, self.kv_latent_cache[:batch_size, :end_pos]
-            ) + 
-            torch.einsum(
-                "blhr,btr->blht", q_rope, self.k_rope_cache[:batch_size, :end_pos]
+
+        if self.optim_type == "torch":
+            scores = (
+                torch.einsum(
+                    "blhk,btk->blht", q_nrope_absorb, self.kv_latent_cache[:batch_size, :end_pos]
+                ) + 
+                torch.einsum(
+                    "blhr,btr->blht", q_rope, self.k_rope_cache[:batch_size, :end_pos]
+                )
+            ) * self.softmax_scale # [batch_size, seq_len_q, num_heads, seq_len_k]
+        elif self.optim_type == "triton":
+            scores = fused_qk_attention(
+                q_nrope_absorb, q_rope, 
+                self.kv_latent_cache[:batch_size, :end_pos], self.k_rope_cache[:batch_size, :end_pos],
+                self.softmax_scale, kernel_version=2
             )
-        ) * self.softmax_scale # [batch_size, seq_len_q, num_heads, seq_len_k]
-
-        # mask the scores
-        if mask is not None:
-            mask = mask.unsqueeze(1).unsqueeze(0) # [1, seq_len_q, 1, seq_len_k]
-            scores += mask # [batch_size, seq_len_q, num_heads, seq_len_k]
-
-        scores = scores.softmax(dim=-1)
-
-        # matmul cache first, then upsample the v, this reduces the computation, otherwise
-        # matmul on the upsampled v, which is much higher dimensional
-        x = torch.einsum(
-            "blht,btk->blhk", scores, self.kv_latent_cache[:batch_size, :end_pos]
-        )
-        proj_kv_up_weight_v = proj_kv_up_weight[:, -self.v_head_dim:, :]
-        x = torch.einsum(
-            "blhk,hdk->blhd", x, proj_kv_up_weight_v
-        ) # [batch_size, seq_len, num_heads, v_head_dim]
-
-        x = x.flatten(start_dim=2) # [batch_size, seq_len, num_heads * v_head_dim]
-        x = self.proj_out(x)
-
-        return x
-
-class MLATriton(nn.Module):
-    def __init__(
-        self,
-        dim: int, # model dim
-        kv_latent_rank: int, # rank of the cached compressed kv (c_kv)
-        q_latent_rank: int, # rank of the cached compressed q (c_q)
-        num_heads: int, # number of heads
-        qk_nrope_head_dim: int, # dim of the q and k heads
-        v_head_dim: int, # dim of the v head
-        qk_rope_head_dim: int, # dim of the q and k rotary embeddings
-        max_batch_size: int, # max batch size
-        max_seq_len: int, # max sequence length
-    ):
-        super().__init__()
-        self.qk_head_dim = qk_nrope_head_dim + qk_rope_head_dim
-
-        self.proj_kv_down = nn.Linear(dim, kv_latent_rank + qk_rope_head_dim, bias=False)
-        self.rms_norm_kv = nn.RMSNorm(kv_latent_rank)
-        self.proj_kv_up = nn.Linear(kv_latent_rank, num_heads * (qk_nrope_head_dim + v_head_dim), bias=False)
-
-        self.proj_q_down = nn.Linear(dim, q_latent_rank, bias=False)
-        self.rms_norm_q = nn.RMSNorm(q_latent_rank)
-        self.proj_q_up = nn.Linear(q_latent_rank, num_heads * self.qk_head_dim, bias=False)
-
-        self.proj_out = nn.Linear(num_heads * v_head_dim, dim, bias=False)
-
-        self.softmax_scale = 1.0 / self.qk_head_dim ** 0.5
-        self.num_heads = num_heads
-        self.kv_latent_rank = kv_latent_rank
-        self.q_latent_rank = q_latent_rank
-        self.qk_rope_head_dim = qk_rope_head_dim
-        self.qk_nrope_head_dim = qk_nrope_head_dim
-        self.v_head_dim = v_head_dim
-
-        self.register_buffer(
-            "kv_latent_cache", 
-            torch.zeros(max_batch_size, max_seq_len, kv_latent_rank), 
-            persistent=False # the buffer will not be saved in the state dict
-        )
-        self.register_buffer(
-            "k_rope_cache", 
-            torch.zeros(max_batch_size, max_seq_len, qk_rope_head_dim),
-            persistent=False
-        )
-    
-    def forward(
-        self, 
-        x: torch.Tensor, 
-        start_pos: int, # the position of the x to be placed on the cache
-        freq_cis: torch.Tensor, # the precomputed freq cis for rotary embeddings
-        mask: Optional[torch.Tensor] = None, # the mask for the attention, [seq_len_q, seq_len_k]
-    ):
-        batch_size, seq_len, dim = x.shape
-        
-        q = self.proj_q_up(self.rms_norm_q(self.proj_q_down(x)))
-        q = q.view(batch_size, seq_len, self.num_heads, self.qk_head_dim)
-        q_nrope, q_rope = q.split(
-            [self.qk_nrope_head_dim, self.qk_rope_head_dim], dim=-1
-        ) # q_nrope: [batch_size, seq_len, num_heads, qk_nrope_head_dim], 
-        # q_rope: [batch_size, seq_len, num_heads, qk_rope_head_dim]
-        q_rope = apply_rotary_emb(q_rope, freq_cis)
-        q = torch.cat([q_nrope, q_rope], dim=-1)
-        
-        kv_latent, k_rope = self.proj_kv_down(x).split(
-            [self.kv_latent_rank, self.qk_rope_head_dim], dim=-1
-        ) # kv_latent: [batch_size, seq_len, kv_latent_rank], k_rope: [batch_size, seq_len, qk_rope_head_dim]
-        k_rope = apply_rotary_emb(k_rope.unsqueeze(2), freq_cis).squeeze(2) # [batch_size, seq_len, qk_rope_head_dim]
-
-        end_pos = start_pos + seq_len
-        self.kv_latent_cache[:batch_size, start_pos:end_pos] = kv_latent
-        self.k_rope_cache[:batch_size, start_pos:end_pos] = k_rope
-
-        # reshape the kv up weight, to make it be absorbed into the q
-        proj_kv_up_weight = self.proj_kv_up.weight # [num_heads * (qk_nrope_head_dim + v_head_dim, kv_latent_rank]
-        proj_kv_up_weight = proj_kv_up_weight.view(
-            self.num_heads, self.qk_nrope_head_dim + self.v_head_dim, self.kv_latent_rank
-        )
-        # q_nrope absorb the kv_up weight, make q_nrope could directly matmul with kv_latent, 
-        # and kv_latent can be directly get from the cache
-        proj_kv_up_weight_q_nrope_absorbed = proj_kv_up_weight[:, :self.qk_nrope_head_dim, :]
-        q_nrope_absorb = torch.einsum(
-            "blhd,hdk->blhk", q_nrope, proj_kv_up_weight_q_nrope_absorbed
-        ) # [batch_size, seq_len, num_heads, kv_latent_rank]
-        
-        scores = fused_qk_attention(
-            q_nrope_absorb, q_rope, 
-            self.kv_latent_cache[:batch_size, :end_pos], self.k_rope_cache[:batch_size, :end_pos],
-            self.softmax_scale
-        )
 
         # mask the scores
         if mask is not None:
@@ -371,7 +276,7 @@ class Layer(nn.Module):
         ffn_hidden_dim: int, # hidden dim of the ffn
     ):
         super().__init__()
-        self.mla = MLATorch(
+        self.mla = MLA(
             dim, kv_latent_rank, q_latent_rank, num_heads, qk_nrope_head_dim, 
             v_head_dim, qk_rope_head_dim, max_batch_size, max_seq_len
         )

@@ -1,10 +1,10 @@
 import torch
 from mla import (
     Transformer, precompute_freqs_cis, 
-    apply_rotary_emb, MLATorch, MLATriton
+    apply_rotary_emb, MLA
 )
 import time
-import torch.profiler as profiler
+from torch.profiler import profile, ProfilerActivity, schedule, tensorboard_trace_handler
 from kernel import fused_qk_attention
 
 
@@ -134,125 +134,6 @@ def test_rope_interpolation():
     assert diff > 1e-4, "RoPE interpolation didn't take effect!"
     print("✅ RoPE interpolation test passed.\n")
 
-
-def benchmark_mla():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Running on {device}")
-
-    dim = 2048
-    num_heads = 16
-    kv_latent_rank = 512
-    q_latent_rank = 512
-    qk_nrope_head_dim = 128
-    qk_rope_head_dim = 64
-    v_head_dim = 128
-    max_batch_size = 8
-    max_seq_len = 4096 * 4
-
-    mla_torch = MLATorch(
-        dim=dim,
-        kv_latent_rank=kv_latent_rank,
-        q_latent_rank=q_latent_rank,
-        num_heads=num_heads,
-        qk_nrope_head_dim=qk_nrope_head_dim,
-        v_head_dim=v_head_dim,
-        qk_rope_head_dim=qk_rope_head_dim,
-        max_batch_size=max_batch_size,
-        max_seq_len=max_seq_len,
-    ).to(device)
-
-    mla_triton = MLATriton(
-        dim=dim,
-        kv_latent_rank=kv_latent_rank,
-        q_latent_rank=q_latent_rank,
-        num_heads=num_heads,
-        qk_nrope_head_dim=qk_nrope_head_dim,
-        v_head_dim=v_head_dim,
-        qk_rope_head_dim=qk_rope_head_dim,
-        max_batch_size=max_batch_size,
-        max_seq_len=max_seq_len,
-    ).to(device)
-
-    mla_triton.load_state_dict(mla_torch.state_dict()) # ensure weights are the same
-
-    batch_size = 8
-    seq_len = 1024
-    x = torch.randn(batch_size, seq_len, dim).to(device)
-
-    start_pos = 0
-    freq_cis = precompute_freqs_cis(
-        qk_rope_head_dim, max_seq_len, seq_len, beta_fast=32, beta_slow=1,
-        rope_theta=10000.0, rope_factor=40.0
-    ).to(device)[start_pos: start_pos + seq_len]
-
-    mask = torch.full((seq_len, seq_len), float("-inf"), device=device).triu_(1)
-
-    # warmup
-    for _ in range(5):
-        _ = mla_torch(x, start_pos, freq_cis, mask)
-
-    torch.cuda.synchronize() if device == "cuda" else None
-    start = time.time()
-
-    # torch profiler benchmark
-    with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
-        schedule=torch.profiler.schedule(wait=1, warmup=1, active=3),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler("./log_dir_fix"),
-        record_shapes=True,
-        with_stack=True,
-        profile_memory=True
-    ) as prof:
-        for _ in range(5):
-            _ = mla_torch(x, start_pos, freq_cis, mask)
-            prof.step()
-
-    torch.cuda.synchronize() if device == "cuda" else None
-
-    print("MLA Torch Profiler Results:")
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
-    end = time.time()
-    avg_time_torch = (end - start) / 10
-
-    # warmup
-    for _ in range(5):
-        _ = mla_triton(x, start_pos, freq_cis, mask)
-
-    torch.cuda.synchronize() if device == "cuda" else None
-    start = time.time()
-
-    # torch profiler benchmark
-    with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
-        schedule=torch.profiler.schedule(wait=1, warmup=1, active=3),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler("./log_dir_fix"),
-        record_shapes=True,
-        with_stack=True,
-        profile_memory=True
-    ) as prof:
-        for _ in range(5):
-            _ = mla_triton(x, start_pos, freq_cis, mask)
-            prof.step()
-
-    torch.cuda.synchronize() if device == "cuda" else None
-
-    print("MLA Triton Profiler Results:")
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
-    end = time.time()
-    avg_time_triton = (end - start) / 10
-
-
-    print(f"MLA Torch forward average time: {avg_time_torch:.4f} seconds")
-    print(f"MLA Triton forward average time: {avg_time_triton:.4f} seconds")
-    print(f"Throughput Torch: {(batch_size * seq_len) / avg_time_torch:.2f} tokens/sec")
-    print(f"Throughput Triton: {(batch_size * seq_len) / avg_time_triton:.2f} tokens/sec")
-
 def test_mla_triton():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -270,7 +151,7 @@ def test_mla_triton():
     max_batch_size = 8
     max_seq_len = 4096 * 4
 
-    mla_torch = MLATorch(
+    mla_torch = MLA(
         dim=dim,
         kv_latent_rank=kv_latent_rank,
         q_latent_rank=q_latent_rank,
@@ -280,9 +161,11 @@ def test_mla_triton():
         qk_rope_head_dim=qk_rope_head_dim,
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
+        dtype=torch.float16,
+        optim_type="torch",
     ).to(device)
 
-    mla_triton = MLATriton(
+    mla_triton = MLA(
         dim=dim,
         kv_latent_rank=kv_latent_rank,
         q_latent_rank=q_latent_rank,
@@ -292,13 +175,15 @@ def test_mla_triton():
         qk_rope_head_dim=qk_rope_head_dim,
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
+        dtype=torch.float16,
+        optim_type="triton",
     ).to(device)
 
     mla_triton.load_state_dict(mla_torch.state_dict())
 
     batch_size = 8
     seq_len = 1024
-    x = torch.randn(batch_size, seq_len, dim, dtype=torch.float32).to(device)
+    x = torch.randn(batch_size, seq_len, dim, dtype=torch.float16).to(device)
 
     start_pos = 0
     freq_cis = precompute_freqs_cis(
@@ -327,10 +212,10 @@ def test_fused_qk_attention():
     R = 64        # rope dim
     softmax_scale = 1.0 / (K + R) ** 0.5  # match with model
 
-    q_nrope_absorb = torch.randn(B, L, H, K, dtype=torch.float32, device='cuda')
-    q_rope = torch.randn(B, L, H, R, dtype=torch.float32, device='cuda')
-    kv_latent_cache = torch.randn(B, T, K, dtype=torch.float32, device='cuda')
-    k_rope_cache = torch.randn(B, T, R, dtype=torch.float32, device='cuda')
+    q_nrope_absorb = torch.randn(B, L, H, K, dtype=torch.float16, device='cuda')
+    q_rope = torch.randn(B, L, H, R, dtype=torch.float16, device='cuda')
+    kv_latent_cache = torch.randn(B, T, K, dtype=torch.float16, device='cuda')
+    k_rope_cache = torch.randn(B, T, R, dtype=torch.float16, device='cuda')
 
     scores_torch = (
         torch.einsum("blhk,btk->blht", q_nrope_absorb, kv_latent_cache) +
@@ -338,18 +223,209 @@ def test_fused_qk_attention():
     ) * softmax_scale
 
     scores_triton = fused_qk_attention(
-        q_nrope_absorb, q_rope, kv_latent_cache, k_rope_cache, softmax_scale
+        q_nrope_absorb, q_rope, kv_latent_cache, k_rope_cache, softmax_scale, 
+        kernel_version=2
     )
 
     print("Max abs diff:", (scores_torch - scores_triton).abs().max().item())
     print("Mean diff:", (scores_torch - scores_triton).abs().mean().item())
     print("Scores equal:", torch.allclose(scores_torch, scores_triton, rtol=1e-3, atol=1e-3))
 
+def benchmark_mla(batch_size=8, seq_len=1024, use_profile=False, dtype=torch.float16):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Running on {device}")
+
+    dim = 2048
+    num_heads = 16
+    kv_latent_rank = 512
+    q_latent_rank = 512
+    qk_nrope_head_dim = 128
+    qk_rope_head_dim = 64
+    v_head_dim = 128
+    max_batch_size = 32
+    max_seq_len = 4096 * 4
+
+    mla_torch = MLA(
+        dim=dim,
+        kv_latent_rank=kv_latent_rank,
+        q_latent_rank=q_latent_rank,
+        num_heads=num_heads,
+        qk_nrope_head_dim=qk_nrope_head_dim,
+        v_head_dim=v_head_dim,
+        qk_rope_head_dim=qk_rope_head_dim,
+        max_batch_size=max_batch_size,
+        max_seq_len=max_seq_len,
+        dtype=dtype,
+        optim_type="torch",
+    ).to(device)
+    mla_torch.eval()
+
+    x = torch.randn(batch_size, seq_len, dim, dtype=dtype).to(device)
+
+    start_pos = 0
+    freq_cis = precompute_freqs_cis(
+        qk_rope_head_dim, max_seq_len, seq_len, beta_fast=32, beta_slow=1,
+        rope_theta=10000.0, rope_factor=40.0
+    ).to(device)[start_pos: start_pos + seq_len].to(dtype)
+
+    mask = torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=dtype).triu_(1)
+
+    torch.cuda.empty_cache() if device == "cuda" else None
+    # warmup
+    with torch.inference_mode():
+        for _ in range(5):
+            _ = mla_torch(x, start_pos, freq_cis, mask)
+
+    torch.cuda.empty_cache() if device == "cuda" else None
+    torch.cuda.synchronize() if device == "cuda" else None
+    start = time.time()
+
+    with torch.inference_mode():
+        for _ in range(10):
+            _ = mla_torch(x, start_pos, freq_cis, mask)
+
+    torch.cuda.synchronize() if device == "cuda" else None
+    end = time.time()
+    avg_time_torch = (end - start) / 10
+
+
+    mla_triton = MLA(
+        dim=dim,
+        kv_latent_rank=kv_latent_rank,
+        q_latent_rank=q_latent_rank,
+        num_heads=num_heads,
+        qk_nrope_head_dim=qk_nrope_head_dim,
+        v_head_dim=v_head_dim,
+        qk_rope_head_dim=qk_rope_head_dim,
+        max_batch_size=max_batch_size,
+        max_seq_len=max_seq_len,
+        dtype=dtype,
+        optim_type="triton",
+    ).to(device)
+
+    mla_triton.load_state_dict(mla_torch.state_dict()) # ensure weights are the same
+    mla_triton.eval()
+
+    torch.cuda.empty_cache() if device == "cuda" else None
+    # warmup
+    with torch.inference_mode():
+        for _ in range(5):
+            _ = mla_triton(x, start_pos, freq_cis, mask)
+
+    torch.cuda.empty_cache() if device == "cuda" else None
+    torch.cuda.synchronize() if device == "cuda" else None
+    start = time.time()
+
+    # torch profiler benchmark
+    with torch.inference_mode():
+        for _ in range(10):
+            _ = mla_triton(x, start_pos, freq_cis, mask)
+
+    torch.cuda.synchronize() if device == "cuda" else None
+    end = time.time()
+    avg_time_triton = (end - start) / 10
+
+    if use_profile:
+        print("\n🔍 Profiler for MLA Torch")
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=schedule(wait=1, warmup=1, active=3),
+            on_trace_ready=tensorboard_trace_handler(f"logdir/torch_{int(time.time())}"),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        ) as prof:
+            for _ in range(5):
+                _ = mla_torch(x, start_pos, freq_cis, mask)
+                prof.step()
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))
+
+        print("\n🔍 Profiler for MLA Triton")
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=schedule(wait=1, warmup=1, active=3),
+            on_trace_ready=tensorboard_trace_handler(f"log_dir/triton_{int(time.time())}"),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        ) as prof:
+            for _ in range(5):
+                _ = mla_triton(x, start_pos, freq_cis, mask)
+                prof.step()
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))
+
+
+    print(f"MLA Torch forward average time: {avg_time_torch:.4f} seconds")
+    print(f"MLA Triton forward average time: {avg_time_triton:.4f} seconds")
+    throughput_torch = (batch_size * seq_len) / avg_time_torch
+    throughput_triton = (batch_size * seq_len) / avg_time_triton
+    print(f"Throughput Torch: {throughput_torch:.2f} tokens/sec")
+    print(f"Throughput Triton: {throughput_triton:.2f} tokens/sec")
+
+    return avg_time_torch, avg_time_triton, throughput_torch, throughput_triton
+
+def benchmark():
+    batch_sizes = [4]
+    seq_lens = [4096]
+    results = {}
+    torch.manual_seed(88)
+
+    for batch_size in batch_sizes:
+        for seq_len in seq_lens:
+            print(f"Batch size: {batch_size}, Sequence length: {seq_len}")
+            (
+                avg_time_torch, 
+                avg_time_triton, 
+                throughput_torch,
+                throughput_triton
+            ) = benchmark_mla(
+                batch_size=batch_size, 
+                seq_len=seq_len, 
+                use_profile=False
+            )
+            results[(batch_size, seq_len)] = (
+                avg_time_torch, 
+                avg_time_triton, 
+                throughput_torch,
+                throughput_triton
+            )
+    
+    import matplotlib.pyplot as plt
+
+    # Extract data for plotting
+    batch_sizes = sorted(set(k[0] for k in results.keys()))
+    seq_lens = sorted(set(k[1] for k in results.keys()))
+
+    torch_throughputs = [
+        [results[(batch_size, seq_len)][2] for seq_len in seq_lens]
+        for batch_size in batch_sizes
+    ]
+    triton_throughputs = [
+        [results[(batch_size, seq_len)][3] for seq_len in seq_lens]
+        for batch_size in batch_sizes
+    ]
+
+    # Plot throughput comparison
+    plt.figure(figsize=(12, 8))
+    for i, batch_size in enumerate(batch_sizes):
+        plt.plot(seq_lens, torch_throughputs[i], label=f"Torch (Batch {batch_size})", marker='o')
+        plt.plot(seq_lens, triton_throughputs[i], label=f"Triton (Batch {batch_size})", marker='x')
+
+    plt.xlabel("Sequence Length")
+    plt.ylabel("Throughput (tokens/sec)")
+    plt.title("Throughput Comparison: Torch vs Triton")
+    plt.legend()
+    plt.grid(True)
+    plt.xscale("log")
+    plt.yscale("log")
+    plt.savefig("throughput_comparison.png")
+
 
 if __name__ == "__main__":
     # test_transformer_forward()
     # test_continuous_inference()
     # test_rope_interpolation()
-    benchmark_mla()
+    # benchmark_mla()
+    benchmark()
     # test_mla_triton()
     # test_fused_qk_attention()
