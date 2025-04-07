@@ -307,6 +307,21 @@ def fused_qk_attention_kernel_2(
         mask=mask_l[:, None] & mask_t[None, :],
     )
 
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {
+                "BLOCK_D": 32
+            }, num_warps=4
+        ),
+        triton.Config(
+            {
+                "BLOCK_D": 64
+            }, num_warps=4
+        ),
+    ],
+    key=['D'] # re-sesearch when changing these values
+)
 @triton.jit
 def fused_apply_rotary_emb_kernel(
     x_ptr, # [B, L, H, D]
@@ -456,7 +471,7 @@ def fused_apply_rotary_emb(
         *x.stride(),
         *freq_cis.stride(),
         *out.stride(),
-        BLOCK_D=32
+        # BLOCK_D=32 # auto tune
     )
 
     return out
