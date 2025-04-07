@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import triton.language as tl
 
 from typing import Optional
-from kernel import fused_qk_attention
+from kernel import fused_qk_attention, fused_apply_rotary_emb
 
 
 def precompute_freqs_cis(
@@ -106,7 +106,7 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 
     Args:
         x (torch.Tensor): Input tensor with positional embeddings to be applied.
-        freqs_cis (torch.Tensor): Precomputed complex exponential values for positional embeddings.
+        freqs_cis (torch.Tensor): Precomputed values (with real and image part of the original complex value) for positional embeddings.
 
     Returns:
         torch.Tensor: Tensor with rotary embeddings applied.
@@ -114,6 +114,7 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     # x: [batch_size, seq_len, num_heads, qk_rope_head_dim (D)]
     # freqs_cis: [L, D // 2, 2]
     dtype = x.dtype
+    # torch.view_as_real(torch.view_as_complex(x.view(*x.shape[:-1], -1, 2))) == x.view(*x.shape[:-1], -1, 2)
     x = torch.view_as_real(torch.view_as_complex(x.view(*x.shape[:-1], -1, 2))) # [..., D // 2, 2]
     x_real = x[..., 0] # [... , D // 2]
     x_imag = x[..., 1] # [... , D // 2]
@@ -122,6 +123,9 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 
     out_real = x_real * freqs_cos - x_imag * freqs_sin # [batch_size, seq_len, num_heads, D // 2]
     out_imag = x_real * freqs_sin + x_imag * freqs_cos
+    # [out_real, out_imag]: [batch_size, seq_len, num_heads, D // 2, 2]
+    # torch stack(): [batch_size, seq_len, num_heads, D // 2, 2]
+    # flatten(3): [batch_size, seq_len, num_heads, D], [real0, imag0, real1, imag1, ...], interleave, rather than concat
     out = torch.stack([out_real, out_imag], dim=-1).flatten(3)
 
     assert out.dtype == dtype, f"Output dtype {out.dtype} does not match input dtype {dtype}"
@@ -206,13 +210,19 @@ class MLA(nn.Module):
             [self.qk_nrope_head_dim, self.qk_rope_head_dim], dim=-1
         ) # q_nrope: [batch_size, seq_len, num_heads, qk_nrope_head_dim], 
         # q_rope: [batch_size, seq_len, num_heads, qk_rope_head_dim]
-        q_rope = apply_rotary_emb(q_rope, freq_cis) # [batch_size, seq_len, num_heads, qk_rope_head_dim]
+        if self.optim_type == "torch":
+            q_rope = apply_rotary_emb(q_rope, freq_cis) # [batch_size, seq_len, num_heads, qk_rope_head_dim]
+        elif self.optim_type == "triton":
+            q_rope = fused_apply_rotary_emb(q_rope, freq_cis)
         q = torch.cat([q_nrope, q_rope], dim=-1)
         
         kv_latent, k_rope = self.proj_kv_down(x).split(
             [self.kv_latent_rank, self.qk_rope_head_dim], dim=-1
         ) # kv_latent: [batch_size, seq_len, kv_latent_rank], k_rope: [batch_size, seq_len, qk_rope_head_dim]
-        k_rope = apply_rotary_emb(k_rope.unsqueeze(2), freq_cis).squeeze(2) # [batch_size, seq_len, qk_rope_head_dim]
+        if self.optim_type == "torch":
+            k_rope = apply_rotary_emb(k_rope.unsqueeze(2), freq_cis).squeeze(2) # [batch_size, seq_len, qk_rope_head_dim]
+        elif self.optim_type == "triton":
+            k_rope = fused_apply_rotary_emb(k_rope.unsqueeze(2), freq_cis).squeeze(2)
 
         end_pos = start_pos + seq_len
         self.kv_latent_cache[:batch_size, start_pos:end_pos] = kv_latent

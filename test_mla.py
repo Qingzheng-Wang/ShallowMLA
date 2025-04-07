@@ -5,7 +5,7 @@ from mla import (
 )
 import time
 from torch.profiler import profile, ProfilerActivity, schedule, tensorboard_trace_handler
-from kernel import fused_qk_attention
+from kernel import fused_qk_attention, fused_apply_rotary_emb
 
 
 def test_transformer_forward():
@@ -231,6 +231,28 @@ def test_fused_qk_attention():
     print("Mean diff:", (scores_torch - scores_triton).abs().mean().item())
     print("Scores equal:", torch.allclose(scores_torch, scores_triton, rtol=1e-3, atol=1e-3))
 
+def test_fused_apply_rotary_emb():
+    B = 8         # batch size
+    L = 1024      # query len
+    H = 16        # num heads
+    D = 64        # rope dim
+
+    x = torch.randn(B, L, H, D, dtype=torch.float32, device='cuda')
+    freqs_cis = torch.randn(L, D // 2, 2, dtype=torch.float32, device='cuda')
+    out_torch = apply_rotary_emb(x, freqs_cis)
+    out_triton = fused_apply_rotary_emb(x, freqs_cis)
+
+    if torch.allclose(out_torch, out_triton, rtol=1e-3, atol=1e-3):
+        print("✅ fused apply rotary emb test passed.")
+        print("Max abs diff:", (out_torch - out_triton).abs().max().item())
+        print("Mean diff:", (out_torch - out_triton).abs().mean().item())
+        print("Outputs equal:", torch.allclose(out_torch, out_triton, rtol=1e-3, atol=1e-3))
+    else:
+        print("❌ fused apply rotary emb test failed.")
+        print("Max abs diff:", (out_torch - out_triton).abs().max().item())
+        print("Mean diff:", (out_torch - out_triton).abs().mean().item())
+        print("Outputs equal:", torch.allclose(out_torch, out_triton, rtol=1e-3, atol=1e-3))
+
 def benchmark_mla(batch_size=8, seq_len=1024, use_profile=False, dtype=torch.float32):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Running on {device}")
@@ -440,6 +462,7 @@ if __name__ == "__main__":
     # test_rope_interpolation()
     # benchmark_mla()
     # benchmark()
-    # test_mla_triton()
+    test_mla_triton()
     # test_fused_qk_attention()
-    test_rope()
+    # test_rope()
+    # test_fused_apply_rotary_emb()
