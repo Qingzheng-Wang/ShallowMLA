@@ -322,7 +322,7 @@ def benchmark_mla(batch_size=8, seq_len=1024, use_profile=False, dtype=torch.flo
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
         dtype=dtype,
-        optim_type="triton",
+        optim_type="ablation:rope",
     ).to(device)
 
     mla_triton.load_state_dict(mla_torch.state_dict()) # ensure weights are the same
@@ -461,8 +461,8 @@ if __name__ == "__main__":
     # test_continuous_inference()
     # test_rope_interpolation()
     # benchmark_mla()
-    # benchmark()
-    test_mla_triton()
+    benchmark()
+    # test_mla_triton()
     # test_fused_qk_attention()
     # test_rope()
     # test_fused_apply_rotary_emb()

@@ -212,8 +212,10 @@ class MLA(nn.Module):
         # q_rope: [batch_size, seq_len, num_heads, qk_rope_head_dim]
         if self.optim_type == "torch":
             q_rope = apply_rotary_emb(q_rope, freq_cis) # [batch_size, seq_len, num_heads, qk_rope_head_dim]
-        elif self.optim_type == "triton":
+        elif self.optim_type == "triton" or "ablation" in self.optim_type and "rope" in self.optim_type:
             q_rope = fused_apply_rotary_emb(q_rope, freq_cis)
+        else: # default
+            q_rope = apply_rotary_emb(q_rope, freq_cis)
         q = torch.cat([q_nrope, q_rope], dim=-1)
         
         kv_latent, k_rope = self.proj_kv_down(x).split(
@@ -221,8 +223,10 @@ class MLA(nn.Module):
         ) # kv_latent: [batch_size, seq_len, kv_latent_rank], k_rope: [batch_size, seq_len, qk_rope_head_dim]
         if self.optim_type == "torch":
             k_rope = apply_rotary_emb(k_rope.unsqueeze(2), freq_cis).squeeze(2) # [batch_size, seq_len, qk_rope_head_dim]
-        elif self.optim_type == "triton":
+        elif self.optim_type == "triton" or "ablation" in self.optim_type and "rope" in self.optim_type:
             k_rope = fused_apply_rotary_emb(k_rope.unsqueeze(2), freq_cis).squeeze(2)
+        else: # default
+            q_rope = apply_rotary_emb(q_rope, freq_cis)
 
         end_pos = start_pos + seq_len
         self.kv_latent_cache[:batch_size, start_pos:end_pos] = kv_latent
@@ -254,13 +258,22 @@ class MLA(nn.Module):
                     "blhr,btr->blht", q_rope, self.k_rope_cache[:batch_size, :end_pos]
                 )
             ) * self.softmax_scale # [batch_size, seq_len_q, num_heads, seq_len_k]
-        elif self.optim_type == "triton":
+        elif self.optim_type == "triton" or "ablation" in self.optim_type and "qk_attention" in self.optim_type:
             kernel_dtype = tl.float16 if x.dtype == torch.float16 else tl.float32
             scores = fused_qk_attention(
                 q_nrope_absorb, q_rope, 
                 self.kv_latent_cache[:batch_size, :end_pos], self.k_rope_cache[:batch_size, :end_pos],
                 self.softmax_scale, kernel_version=2, dtype=kernel_dtype
             )
+        else:
+            scores = (
+                torch.einsum(
+                    "blhk,btk->blht", q_nrope_absorb, self.kv_latent_cache[:batch_size, :end_pos]
+                ) + 
+                torch.einsum(
+                    "blhr,btr->blht", q_rope, self.k_rope_cache[:batch_size, :end_pos]
+                )
+            ) * self.softmax_scale # [batch_size, seq_len_q, num_heads, seq_len_k]
 
         # mask the scores
         if mask is not None:
