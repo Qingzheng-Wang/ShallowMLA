@@ -226,10 +226,10 @@ class MLA(nn.Module):
         elif self.optim_type == "triton" or "ablation" in self.optim_type and "rope" in self.optim_type:
             k_rope = fused_apply_rotary_emb(k_rope.unsqueeze(2), freq_cis).squeeze(2)
         else: # default
-            q_rope = apply_rotary_emb(q_rope, freq_cis)
+            k_rope = apply_rotary_emb(k_rope.unsqueeze(2), freq_cis).squeeze(2)
 
         end_pos = start_pos + seq_len
-        self.kv_latent_cache[:batch_size, start_pos:end_pos] = kv_latent
+        self.kv_latent_cache[:batch_size, start_pos:end_pos] = self.rms_norm_kv(kv_latent)
         self.k_rope_cache[:batch_size, start_pos:end_pos] = k_rope
 
         # reshape the kv up weight, to make it be absorbed into the q

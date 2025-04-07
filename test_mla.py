@@ -322,7 +322,7 @@ def benchmark_mla(batch_size=8, seq_len=1024, use_profile=False, dtype=torch.flo
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
         dtype=dtype,
-        optim_type="ablation:rope",
+        optim_type="ablation:rope", # if use rope or qk_attention only, specicy ablation:rop or ablation:qk_attention
     ).to(device)
 
     mla_triton.load_state_dict(mla_torch.state_dict()) # ensure weights are the same
