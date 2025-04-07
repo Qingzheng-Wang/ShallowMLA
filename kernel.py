@@ -1,6 +1,7 @@
 import triton
 import triton.language as tl
 import torch
+from typing import Optional
 
 @triton.autotune(
     configs=[
@@ -358,3 +359,114 @@ def fused_qk_attention(
     ) # the block sizes is tuned by autotune
 
     return out
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_T": 128}, num_warps=4),
+        triton.Config({"BLOCK_T": 64}, num_warps=4),
+    ],
+    key=["BLOCK_T"]
+)
+@triton.jit
+def fused_mask_softmax_kernel(
+    scores_ptr,         # pointer to scores, shape [B, L, H, T]
+    mask_ptr,           # pointer to mask, shape [1, L, 1, T]
+    B, L, H, T,         # scores 的尺寸信息
+    stride_scores_b, stride_scores_l, stride_scores_h, stride_scores_t,
+    stride_mask_l, stride_mask_t,  # mask 只用到 l 和 t 两个维度的 stride
+    BLOCK_T: tl.constexpr,          # 每次处理 T 维度上的 BLOCK_T 个元素
+):
+    # 每个程序处理一个 row：对应 (b, l, h)
+    pid = tl.program_id(0)
+    # 根据 grid 的 size (B*L*H) 解码出 b, l, h
+    tmp = pid
+    b = tmp // (L * H)
+    tmp = tmp % (L * H)
+    l = tmp // H
+    h = tmp % H
+
+    # 当前 row 在 scores 中的起始地址
+    row_scores_ptr = scores_ptr + b * stride_scores_b + l * stride_scores_l + h * stride_scores_h
+
+    # 第一遍：扫描 T 维度，计算最大值（用于数值稳定性）
+    row_max = -1e9  # 这里直接用标量来保存最大值
+    offs = tl.arange(0, BLOCK_T)
+    for start in range(0, T, BLOCK_T):
+        offs_t = start + offs
+        mask_valid = offs_t < T
+        # 加载 scores tile
+        scores_tile = tl.load(
+            row_scores_ptr + offs_t * stride_scores_t,
+            mask=mask_valid,
+            other=-1e9
+        )
+        # 加载 mask 对应部分（mask shape 为 [1, L, 1, T]，因此只与 l 和 t 有关）
+        mask_tile = tl.load(
+            mask_ptr + l * stride_mask_l + offs_t * stride_mask_t,
+            mask=mask_valid,
+            other=0.0
+        )
+        tile = scores_tile + mask_tile
+        row_max = tl.maximum(row_max, tl.max(tile, axis=0))
+    
+    # 第二遍：计算 exp(x - max) 的和
+    row_sum = 0.0
+    for start in range(0, T, BLOCK_T):
+        offs_t = start + offs
+        mask_valid = offs_t < T
+        scores_tile = tl.load(
+            row_scores_ptr + offs_t * stride_scores_t,
+            mask=mask_valid,
+            other=-1e9
+        )
+        mask_tile = tl.load(
+            mask_ptr + l * stride_mask_l + offs_t * stride_mask_t,
+            mask=mask_valid,
+            other=0.0
+        )
+        tile = scores_tile + mask_tile
+        tile = tile - row_max
+        exp_tile = tl.exp(tile)
+        row_sum += tl.sum(exp_tile, axis=0)
+    
+    # 第三遍：归一化后写回 scores
+    for start in range(0, T, BLOCK_T):
+        offs_t = start + offs
+        mask_valid = offs_t < T
+        scores_tile = tl.load(
+            row_scores_ptr + offs_t * stride_scores_t,
+            mask=mask_valid,
+            other=-1e9
+        )
+        mask_tile = tl.load(
+            mask_ptr + l * stride_mask_l + offs_t * stride_mask_t,
+            mask=mask_valid,
+            other=0.0
+        )
+        tile = scores_tile + mask_tile
+        tile = tile - row_max
+        exp_tile = tl.exp(tile)
+        softmax_tile = exp_tile / row_sum
+        tl.store(row_scores_ptr + offs_t * stride_scores_t, softmax_tile, mask=mask_valid)
+    
+
+def fused_mask_softmax(scores: torch.Tensor, mask: torch.Tensor):
+    """
+    fused_mask_softmax: 对 scores 加上 mask 后沿最后一个维度做 softmax 归一化
+    scores: [B, L, H, T]
+    mask: [1, L, 1, T]
+    """
+    B, L, H, T = scores.shape
+    # 获取 scores 各维度的 stride
+    stride_scores_b, stride_scores_l, stride_scores_h, stride_scores_t = scores.stride()
+    # mask 的 shape 为 [1, L, 1, T]，只用到 l 和 t 两个维度的 stride
+    _, stride_mask_l, _, stride_mask_t = mask.stride()
+
+    # grid 大小：每个 block 处理一个 row，即一个 (b, l, h)
+    grid = lambda meta: (B * L * H,)
+    fused_mask_softmax_kernel[grid](
+        scores, mask, B, L, H, T,
+        stride_scores_b, stride_scores_l, stride_scores_h, stride_scores_t,
+        stride_mask_l, stride_mask_t,
+        # BLOCK_T 会由 autotune 自动选择
+    )

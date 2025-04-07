@@ -429,4 +429,6 @@ if __name__ == "__main__":
     # benchmark_mla()
     # benchmark()
     test_mla_triton()
+    benchmark_mla()
+    test_mla_triton()
     # test_fused_qk_attention()
