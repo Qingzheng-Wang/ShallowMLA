@@ -88,16 +88,16 @@ def precompute_freqs_cis(
         return ramp_func
 
     # theta_i = 1 / (rope_theta ^ (2i / d)) i in {0, 2, ... d - 2}
-    freqs = 1.0 / (rope_theta ** (torch.arange(0, qk_rope_head_dim, 2) / qk_rope_head_dim))
+    freqs = 1.0 / (rope_theta ** (torch.arange(0, qk_rope_head_dim, 2) / qk_rope_head_dim)) # [D // 2]
     if seq_len > seq_len_train: # if inference seq_len > seq_len_train
         low, high = find_correction_range(beta_fast, beta_slow, qk_rope_head_dim, rope_theta, seq_len_train)
         smooth = 1 - linear_ramp_factor(low, high, qk_rope_head_dim // 2)
         freqs = freqs / rope_factor * (1 - smooth) + freqs * smooth
 
-    t = torch.arange(seq_len)
-    freqs = torch.outer(t, freqs) # outer product, freqs[t, i] = theta_i * t
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs) # exp(j * theta_i * t)
-    return torch.view_as_real(freqs_cis).to(dtype) # [..., 2], 0 for real, 1 for imag
+    t = torch.arange(seq_len) # [L]
+    freqs = torch.outer(t, freqs) # outer product, freqs[t, i] = theta_i * t [L, D // 2]
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs) # exp(j * theta_i * t) [L, D // 2], but in complex form, torch.complex64 if input float32
+    return torch.view_as_real(freqs_cis).to(dtype) # [L, D // 2, 2], 0 for real, 1 for imag
 
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
@@ -111,20 +111,35 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     Returns:
         torch.Tensor: Tensor with rotary embeddings applied.
     """
+    # x: [batch_size, seq_len, num_heads, qk_rope_head_dim (D)]
+    # freqs_cis: [L, D // 2, 2]
     dtype = x.dtype
-    x = x.view(*x.shape[:-1], -1, 2)
-    x_real = x[..., 0]
-    x_imag = x[..., 1]
-    freqs_cos = freqs_cis[:, :, 0].unsqueeze(0).unsqueeze(2)
-    freqs_sin = freqs_cis[:, :, 1].unsqueeze(0).unsqueeze(2)
+    x = torch.view_as_real(torch.view_as_complex(x.view(*x.shape[:-1], -1, 2))) # [..., D // 2, 2]
+    x_real = x[..., 0] # [... , D // 2]
+    x_imag = x[..., 1] # [... , D // 2]
+    freqs_cos = freqs_cis[:, :, 0].unsqueeze(0).unsqueeze(2) # [1, L, 1, D // 2]
+    freqs_sin = freqs_cis[:, :, 1].unsqueeze(0).unsqueeze(2) # [1, L, 1, D // 2]
 
-    out_real = x_real * freqs_cos - x_imag * freqs_sin
+    out_real = x_real * freqs_cos - x_imag * freqs_sin # [batch_size, seq_len, num_heads, D // 2]
     out_imag = x_real * freqs_sin + x_imag * freqs_cos
-    out = torch.stack([out_real, out_imag], dim=-1).flatten(3)  # [B, L, H, D]
+    out = torch.stack([out_real, out_imag], dim=-1).flatten(3)
 
     assert out.dtype == dtype, f"Output dtype {out.dtype} does not match input dtype {dtype}"
     return out
-    
+
+def apply_rotary_emb_origin(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    """
+    THIS IS THE ORIGINAL VERSION OF APPLY_ROTARY_EMB BASED ON COMPLEX FREQS_CIS
+    BUT I MODIFIED IT TO USE THE 2 SEPARATE DIMENSIONS FOR REAL AND IMAGINARY PARTS
+    DO NOT USE THIS FUNCTION !!!!!
+    """
+    # x: [batch_size, seq_len, num_heads, qk_rope_head_dim (D)]
+    # freqs_cis: [L, D // 2]
+    dtype = x.dtype
+    x = torch.view_as_complex(x.float().view(*x.shape[:-1], -1, 2)) # [B, L, H, D // 2]
+    freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1)) # [1, L, 1, D // 2]
+    y = torch.view_as_real(x * freqs_cis).flatten(3)
+    return y.to(dtype)
 
 
 class MLA(nn.Module):
@@ -191,7 +206,7 @@ class MLA(nn.Module):
             [self.qk_nrope_head_dim, self.qk_rope_head_dim], dim=-1
         ) # q_nrope: [batch_size, seq_len, num_heads, qk_nrope_head_dim], 
         # q_rope: [batch_size, seq_len, num_heads, qk_rope_head_dim]
-        q_rope = apply_rotary_emb(q_rope, freq_cis)
+        q_rope = apply_rotary_emb(q_rope, freq_cis) # [batch_size, seq_len, num_heads, qk_rope_head_dim]
         q = torch.cat([q_nrope, q_rope], dim=-1)
         
         kv_latent, k_rope = self.proj_kv_down(x).split(

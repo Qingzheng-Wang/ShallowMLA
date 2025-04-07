@@ -421,6 +421,18 @@ def benchmark():
     plt.yscale("log")
     plt.savefig("throughput_comparison.png")
 
+def test_rope():
+    # test if two version of apply_rotary_emb are the same
+    # the origin is input with freqs_cis as complex
+    # the new one is input with freqs as real and imag
+    x = torch.randn(2, 4, 4, 4)
+    freqs = torch.randn(4, 2, 2)
+    freqs_complex = torch.view_as_complex(freqs)
+    from mla import apply_rotary_emb, apply_rotary_emb_origin
+    out = apply_rotary_emb(x, freqs)
+    out_origin = apply_rotary_emb_origin(x, freqs_complex)
+    if torch.allclose(out, out_origin):
+        print("✅ RoPE test passed.")
 
 if __name__ == "__main__":
     # test_transformer_forward()
@@ -428,5 +440,6 @@ if __name__ == "__main__":
     # test_rope_interpolation()
     # benchmark_mla()
     # benchmark()
-    test_mla_triton()
+    # test_mla_triton()
     # test_fused_qk_attention()
+    test_rope()
