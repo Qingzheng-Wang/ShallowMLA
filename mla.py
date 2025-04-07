@@ -237,18 +237,24 @@ class MLA(nn.Module):
                 self.softmax_scale, kernel_version=2, dtype=kernel_dtype
             )
 
-        if self.optim_type == "torch":
-            # mask the scores
-            mask = mask.unsqueeze(1).unsqueeze(0) # [1, seq_len_q, 1, seq_len_k]
-            scores += mask # [batch_size, seq_len_q, num_heads, seq_len_k]
+        # if self.optim_type == "torch":
+        #     # mask the scores
+        #     mask = mask.unsqueeze(1).unsqueeze(0) # [1, seq_len_q, 1, seq_len_k]
+        #     scores += mask # [batch_size, seq_len_q, num_heads, seq_len_k]
 
-            scores = scores.softmax(dim=-1)
+        #     scores = scores.softmax(dim=-1)
         
-        elif self.optim_type == "triton":
-            # 将 mask 调整为 [1, seq_len_q, 1, seq_len_k]
-            mask = mask.unsqueeze(0).unsqueeze(2)
-            # 直接在 scores 上进行 fused mask+softmax
-            fused_mask_softmax(scores, mask)
+        # elif self.optim_type == "triton":
+        #     # 将 mask 调整为 [1, seq_len_q, 1, seq_len_k]
+        #     mask = mask.unsqueeze(0).unsqueeze(2)
+        #     # 直接在 scores 上进行 fused mask+softmax
+        #     fused_mask_softmax(scores, mask)
+
+        # mask the scores
+        mask = mask.unsqueeze(1).unsqueeze(0) # [1, seq_len_q, 1, seq_len_k]
+        scores += mask # [batch_size, seq_len_q, num_heads, seq_len_k]
+
+        scores = scores.softmax(dim=-1)
 
         # matmul cache first, then upsample the v, this reduces the computation, otherwise
         # matmul on the upsampled v, which is much higher dimensional
