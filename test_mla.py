@@ -161,7 +161,7 @@ def test_mla_triton():
         qk_rope_head_dim=qk_rope_head_dim,
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
-        dtype=torch.float16,
+        dtype=torch.float32,
         optim_type="torch",
     ).to(device)
 
@@ -175,7 +175,7 @@ def test_mla_triton():
         qk_rope_head_dim=qk_rope_head_dim,
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
-        dtype=torch.float16,
+        dtype=torch.float32,
         optim_type="triton",
     ).to(device)
 
@@ -183,7 +183,7 @@ def test_mla_triton():
 
     batch_size = 8
     seq_len = 1024
-    x = torch.randn(batch_size, seq_len, dim, dtype=torch.float16).to(device)
+    x = torch.randn(batch_size, seq_len, dim, dtype=torch.float32).to(device)
 
     start_pos = 0
     freq_cis = precompute_freqs_cis(
@@ -212,10 +212,10 @@ def test_fused_qk_attention():
     R = 64        # rope dim
     softmax_scale = 1.0 / (K + R) ** 0.5  # match with model
 
-    q_nrope_absorb = torch.randn(B, L, H, K, dtype=torch.float16, device='cuda')
-    q_rope = torch.randn(B, L, H, R, dtype=torch.float16, device='cuda')
-    kv_latent_cache = torch.randn(B, T, K, dtype=torch.float16, device='cuda')
-    k_rope_cache = torch.randn(B, T, R, dtype=torch.float16, device='cuda')
+    q_nrope_absorb = torch.randn(B, L, H, K, dtype=torch.float32, device='cuda')
+    q_rope = torch.randn(B, L, H, R, dtype=torch.float32, device='cuda')
+    kv_latent_cache = torch.randn(B, T, K, dtype=torch.float32, device='cuda')
+    k_rope_cache = torch.randn(B, T, R, dtype=torch.float32, device='cuda')
 
     scores_torch = (
         torch.einsum("blhk,btk->blht", q_nrope_absorb, kv_latent_cache) +
@@ -231,7 +231,7 @@ def test_fused_qk_attention():
     print("Mean diff:", (scores_torch - scores_triton).abs().mean().item())
     print("Scores equal:", torch.allclose(scores_torch, scores_triton, rtol=1e-3, atol=1e-3))
 
-def benchmark_mla(batch_size=8, seq_len=1024, use_profile=False, dtype=torch.float16):
+def benchmark_mla(batch_size=8, seq_len=1024, use_profile=False, dtype=torch.float32):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Running on {device}")
 
@@ -427,6 +427,6 @@ if __name__ == "__main__":
     # test_continuous_inference()
     # test_rope_interpolation()
     # benchmark_mla()
-    benchmark()
-    # test_mla_triton()
+    # benchmark()
+    test_mla_triton()
     # test_fused_qk_attention()
