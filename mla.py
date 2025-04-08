@@ -220,22 +220,31 @@ class MLA(nn.Module):
             "blhd,hdk->blhk", q_nrope, proj_kv_up_weight_q_nrope_absorbed
         ) # [batch_size, seq_len, num_heads, kv_latent_rank]
 
-        if self.optim_type == "torch":
-            scores = (
-                torch.einsum(
-                    "blhk,btk->blht", q_nrope_absorb, self.kv_latent_cache[:batch_size, :end_pos]
-                ) + 
-                torch.einsum(
-                    "blhr,btr->blht", q_rope, self.k_rope_cache[:batch_size, :end_pos]
-                )
-            ) * self.softmax_scale # [batch_size, seq_len_q, num_heads, seq_len_k]
-        elif self.optim_type == "triton":
-            kernel_dtype = tl.float16 if x.dtype == torch.float16 else tl.float32
-            scores = fused_qk_attention(
-                q_nrope_absorb, q_rope, 
-                self.kv_latent_cache[:batch_size, :end_pos], self.k_rope_cache[:batch_size, :end_pos],
-                self.softmax_scale, kernel_version=2, dtype=kernel_dtype
+        # if self.optim_type == "torch":
+        #     scores = (
+        #         torch.einsum(
+        #             "blhk,btk->blht", q_nrope_absorb, self.kv_latent_cache[:batch_size, :end_pos]
+        #         ) + 
+        #         torch.einsum(
+        #             "blhr,btr->blht", q_rope, self.k_rope_cache[:batch_size, :end_pos]
+        #         )
+        #     ) * self.softmax_scale # [batch_size, seq_len_q, num_heads, seq_len_k]
+        # elif self.optim_type == "triton":
+        #     kernel_dtype = tl.float16 if x.dtype == torch.float16 else tl.float32
+        #     scores = fused_qk_attention(
+        #         q_nrope_absorb, q_rope, 
+        #         self.kv_latent_cache[:batch_size, :end_pos], self.k_rope_cache[:batch_size, :end_pos],
+        #         self.softmax_scale, kernel_version=2, dtype=kernel_dtype
+        #     )
+
+        scores = (
+            torch.einsum(
+                "blhk,btk->blht", q_nrope_absorb, self.kv_latent_cache[:batch_size, :end_pos]
+            ) + 
+            torch.einsum(
+                "blhr,btr->blht", q_rope, self.k_rope_cache[:batch_size, :end_pos]
             )
+        ) * self.softmax_scale # [batch_size, seq_len_q, num_heads, seq_len_k]
 
         if self.optim_type == "torch":
             mask = mask.unsqueeze(1).unsqueeze(0) # [1, seq_len_q, 1, seq_len_k]
