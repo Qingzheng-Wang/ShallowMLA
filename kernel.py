@@ -370,36 +370,36 @@ def fused_qk_attention(
 def fused_mask_softmax_kernel(
     scores_ptr,         # pointer to scores, shape [B, L, H, T]
     mask_ptr,           # pointer to mask, shape [1, L, 1, T]
-    B, L, H, T,         # scores 的尺寸信息
+    B, L, H, T,         # dimensions of scores
     stride_scores_b, stride_scores_l, stride_scores_h, stride_scores_t,
-    stride_mask_l, stride_mask_t,  # mask 只用到 l 和 t 两个维度的 stride
-    BLOCK_T: tl.constexpr,          # 每次处理 T 维度上的 BLOCK_T 个元素
+    stride_mask_l, stride_mask_t,  # mask only uses strides of the l and t dimensions
+    BLOCK_T: tl.constexpr,          # number of elements processed in the T dimension per block
 ):
-    # 每个程序处理一个 row：对应 (b, l, h)
+    # Each program processes one row, corresponding to (b, l, h)
     pid = tl.program_id(0)
-    # 根据 grid 的 size (B*L*H) 解码出 b, l, h
+    # Decode b, l, h from the grid size (B*L*H)
     tmp = pid
     b = tmp // (L * H)
     tmp = tmp % (L * H)
     l = tmp // H
     h = tmp % H
 
-    # 当前 row 在 scores 中的起始地址
+    # Starting address of the current row in scores
     row_scores_ptr = scores_ptr + b * stride_scores_b + l * stride_scores_l + h * stride_scores_h
 
-    # 第一遍：扫描 T 维度，计算最大值（用于数值稳定性）
-    row_max = -1e9  # 这里直接用标量来保存最大值
+    # First pass: Scan the T dimension to compute the maximum value (for numerical stability)
+    row_max = -1e9  # Using a scalar to store the maximum value directly
     offs = tl.arange(0, BLOCK_T)
     for start in range(0, T, BLOCK_T):
         offs_t = start + offs
         mask_valid = offs_t < T
-        # 加载 scores tile
+        # Load the scores tile
         scores_tile = tl.load(
             row_scores_ptr + offs_t * stride_scores_t,
             mask=mask_valid,
             other=-1e9
         )
-        # 加载 mask 对应部分（mask shape 为 [1, L, 1, T]，因此只与 l 和 t 有关）
+        # Load the corresponding mask tile (mask shape is [1, L, 1, T], so it only relates to the l and t dimensions)
         mask_tile = tl.load(
             mask_ptr + l * stride_mask_l + offs_t * stride_mask_t,
             mask=mask_valid,
@@ -408,7 +408,7 @@ def fused_mask_softmax_kernel(
         tile = scores_tile + mask_tile
         row_max = tl.maximum(row_max, tl.max(tile, axis=0))
     
-    # 第二遍：计算 exp(x - max) 的和
+    # Second pass: Compute the sum of exp(x - max)
     row_sum = 0.0
     for start in range(0, T, BLOCK_T):
         offs_t = start + offs
@@ -428,7 +428,7 @@ def fused_mask_softmax_kernel(
         exp_tile = tl.exp(tile)
         row_sum += tl.sum(exp_tile, axis=0)
     
-    # 第三遍：归一化后写回 scores
+    # Third pass: Normalize and write back to scores
     for start in range(0, T, BLOCK_T):
         offs_t = start + offs
         mask_valid = offs_t < T
@@ -451,21 +451,21 @@ def fused_mask_softmax_kernel(
 
 def fused_mask_softmax(scores: torch.Tensor, mask: torch.Tensor):
     """
-    fused_mask_softmax: 对 scores 加上 mask 后沿最后一个维度做 softmax 归一化
+    fused_mask_softmax: Apply mask to scores and perform softmax normalization along the last dimension.
     scores: [B, L, H, T]
     mask: [1, L, 1, T]
     """
     B, L, H, T = scores.shape
-    # 获取 scores 各维度的 stride
+    # Get the strides for each dimension of scores
     stride_scores_b, stride_scores_l, stride_scores_h, stride_scores_t = scores.stride()
-    # mask 的 shape 为 [1, L, 1, T]，只用到 l 和 t 两个维度的 stride
+    # Mask's shape is [1, L, 1, T]; only the strides for l and t dimensions are used
     _, stride_mask_l, _, stride_mask_t = mask.stride()
 
-    # grid 大小：每个 block 处理一个 row，即一个 (b, l, h)
+    # Grid size: each block processes one row, i.e., one (b, l, h)
     grid = lambda meta: (B * L * H,)
     fused_mask_softmax_kernel[grid](
         scores, mask, B, L, H, T,
         stride_scores_b, stride_scores_l, stride_scores_h, stride_scores_t,
         stride_mask_l, stride_mask_t,
-        # BLOCK_T 会由 autotune 自动选择
+        # BLOCK_T will be automatically selected by autotune
     )

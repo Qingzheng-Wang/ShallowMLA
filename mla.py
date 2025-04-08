@@ -238,12 +238,10 @@ class MLA(nn.Module):
             )
 
         if self.optim_type == "torch":
-            # mask the scores
-            if mask is not None:
-                mask = mask.unsqueeze(1).unsqueeze(0) # [1, seq_len_q, 1, seq_len_k]
-                scores += mask # [batch_size, seq_len_q, num_heads, seq_len_k]
-
+            mask = mask.unsqueeze(1).unsqueeze(0) # [1, seq_len_q, 1, seq_len_k]
+            scores += mask # [batch_size, seq_len_q, num_heads, seq_len_k]
             scores = scores.softmax(dim=-1)
+        
         elif self.optim_type == "triton":
             mask = mask.unsqueeze(1).unsqueeze(0)
             fused_mask_softmax(scores, mask)
