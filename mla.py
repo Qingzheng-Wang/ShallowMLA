@@ -7,7 +7,6 @@ import triton.language as tl
 from typing import Optional
 from kernel import fused_qk_attention, fused_apply_rotary_emb, fused_rms_norm
 
-import pdb
 
 def precompute_freqs_cis(
     qk_rope_head_dim: int, 
