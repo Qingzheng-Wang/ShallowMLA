@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import triton.language as tl
 
 from typing import Optional
-from kernel import fused_qk_attention, fused_apply_rotary_emb, fused_rms_norm
+from kernel import fused_qk_attention, fused_apply_rotary_emb, fused_rms_norm, fused_mask_softmax
 
 
 def precompute_freqs_cis(
@@ -291,10 +291,16 @@ class MLA(nn.Module):
 
         # mask the scores
         if mask is not None:
-            mask = mask.unsqueeze(1).unsqueeze(0) # [1, seq_len_q, 1, seq_len_k]
-            scores += mask # [batch_size, seq_len_q, num_heads, seq_len_k]
+            if self.optim_type == "triton" or ("ablation" in self.optim_type and "softmax" in self.optim_type): 
+                mask = mask.unsqueeze(1).unsqueeze(0)
+                fused_mask_softmax(scores, mask)
 
-        scores = scores.softmax(dim=-1)
+            else:
+                mask = mask.unsqueeze(1).unsqueeze(0) # [1, seq_len_q, 1, seq_len_k]
+                scores += mask # [batch_size, seq_len_q, num_heads, seq_len_k]
+                scores = scores.softmax(dim=-1)
+        else:
+            scores = scores.softmax(dim=-1)
 
         # matmul cache first, then upsample the v, this reduces the computation, otherwise
         # matmul on the upsampled v, which is much higher dimensional
@@ -463,4 +469,3 @@ if __name__ == "__main__":
     print("Logits shape:", logits.shape)              # [2, vocab_size]
     assert logits.shape == (batch_size, vocab_size), "Output shape mismatch"
     print("Test passed.")
-
