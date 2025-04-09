@@ -475,3 +475,95 @@ def fused_apply_rotary_emb(
     )
 
     return out
+
+DEFAULT_BLOCK_SIZE = 1024
+
+@triton.jit
+def _optimized_rms_norm_kernel(
+    x_ptr, out_ptr, weight_ptr,
+    batch_size, normalized_dim,
+    stride_x_batch, stride_x_dim,
+    stride_out_batch, stride_out_dim,
+    stride_weight,
+    epsilon,
+    BLOCK_SIZE: tl.constexpr = DEFAULT_BLOCK_SIZE,
+):
+    """
+    Every program deals with one row on the x (assuming the last dim as the dim to normalized) 
+    """
+    pid = tl.program_id(0)
+    
+    if pid >= batch_size:
+        return
+
+    # assuming the storage of x is contiguous
+    row_ptr = x_ptr + pid * stride_x_batch
+    out_row_ptr = out_ptr + pid * stride_out_batch
+
+    # calculate the squared mean
+    sum_squares = 0.0
+    offs = tl.arange(0, BLOCK_SIZE)
+    for block_start in range(0, normalized_dim, BLOCK_SIZE):
+        block_offs = block_start + offs
+        mask = block_offs < normalized_dim
+        x_block = tl.load(row_ptr + block_offs * stride_x_dim, mask=mask, other=0.0)
+        sum_squares += tl.sum(x_block * x_block * mask, axis=0)
+
+    inv_rms = 1.0 / tl.sqrt(sum_squares / normalized_dim + epsilon)
+
+    # normalize and multiplied by scale（weight）
+    for block_start in range(0, normalized_dim, BLOCK_SIZE):
+        block_offs = block_start + offs
+        mask = block_offs < normalized_dim
+        x_block = tl.load(row_ptr + block_offs * stride_x_dim, mask=mask, other=0.0)
+        weight_block = tl.load(weight_ptr + block_offs * stride_weight, mask=mask, other=1.0)
+        out_block = x_block * inv_rms * weight_block
+        tl.store(out_row_ptr + block_offs * stride_out_dim, out_block, mask=mask)
+
+def fused_rms_norm(x, normalized_shape, weight, epsilon=1e-6):
+    """
+    Fused RMSNorm
+
+    Require:
+      - the last dim's shape should equals normalized_shape[0]
+    """
+    if weight.dtype != x.dtype:
+        weight = weight.to(x.dtype)
+
+    normalized_dim = normalized_shape[0]
+    
+    if not x.is_contiguous():
+        x = x.contiguous()
+
+    # batchsize_by_seqlen = batchsize * seqlen
+    batchsize_by_seqlen = x.numel() // normalized_dim
+
+    # create output tensor
+    out = torch.empty_like(x)
+
+    stride_x_batch = normalized_dim  # stride per row
+    stride_x_dim = 1
+
+    stride_out_batch = normalized_dim
+    stride_out_dim = 1
+
+    # assuming the weight to be 1-D tensor
+    stride_weight = weight.stride(0) if weight.dim() > 0 else 0
+
+    grid = (batchsize_by_seqlen,)
+
+    _optimized_rms_norm_kernel[grid](
+        x_ptr=x,
+        out_ptr=out,
+        weight_ptr=weight,
+        batch_size=batchsize_by_seqlen,
+        normalized_dim=normalized_dim,
+        stride_x_batch=stride_x_batch,
+        stride_x_dim=stride_x_dim,
+        stride_out_batch=stride_out_batch,
+        stride_out_dim=stride_out_dim,
+        stride_weight=stride_weight,
+        epsilon=epsilon,
+    )
+
+    return out

@@ -5,8 +5,9 @@ import torch.nn.functional as F
 import triton.language as tl
 
 from typing import Optional
-from kernel import fused_qk_attention, fused_apply_rotary_emb
+from kernel import fused_qk_attention, fused_apply_rotary_emb, fused_rms_norm
 
+import pdb
 
 def precompute_freqs_cis(
     qk_rope_head_dim: int, 
@@ -145,6 +146,23 @@ def apply_rotary_emb_origin(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.T
     y = torch.view_as_real(x * freqs_cis).flatten(3)
     return y.to(dtype)
 
+class RMSNormTriton(torch.nn.Module):
+    """
+    Root Mean Square Layer Normalization (RMSNorm) optimized using Triton.
+
+    Args:
+        dim (int): Dimension of the input tensor.
+        eps (float): Epsilon value for numerical stability. Defaults to 1e-6.
+    """
+    def __init__(self, dim: int, eps: float = 1e-6, dtype: torch.dtype = torch.float16):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.weight = torch.nn.Parameter(torch.ones(dim, dtype=dtype))
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return fused_rms_norm(x, (self.dim,), self.weight, self.eps)
+
 
 class MLA(nn.Module):
     def __init__(
@@ -162,14 +180,25 @@ class MLA(nn.Module):
         optim_type: str = "torch", # the type of the optimization, "torch" or "triton"
     ):
         super().__init__()
+        
+        self.optim_type = optim_type
+        
         self.qk_head_dim = qk_nrope_head_dim + qk_rope_head_dim
 
         self.proj_kv_down = nn.Linear(dim, kv_latent_rank + qk_rope_head_dim, bias=False, dtype=dtype)
-        self.rms_norm_kv = nn.RMSNorm(kv_latent_rank, dtype=dtype)
+        if self.optim_type == "torch":
+            self.rms_norm_kv = nn.RMSNorm(kv_latent_rank, dtype=dtype)
+            self.rms_norm_q = nn.RMSNorm(q_latent_rank, dtype=dtype)
+        elif (self.optim_type == "triton") or (("ablation" in self.optim_type) and ("rmsnorm" in self.optim_type)):
+            self.rms_norm_kv = RMSNormTriton(kv_latent_rank, dtype=dtype)
+            self.rms_norm_q = RMSNormTriton(q_latent_rank, dtype=dtype)
+        else:
+            self.rms_norm_kv = nn.RMSNorm(kv_latent_rank, dtype=dtype)
+            self.rms_norm_q = nn.RMSNorm(q_latent_rank, dtype=dtype)
+        
         self.proj_kv_up = nn.Linear(kv_latent_rank, num_heads * (qk_nrope_head_dim + v_head_dim), bias=False, dtype=dtype)
 
         self.proj_q_down = nn.Linear(dim, q_latent_rank, bias=False, dtype=dtype)
-        self.rms_norm_q = nn.RMSNorm(q_latent_rank, dtype=dtype)
         self.proj_q_up = nn.Linear(q_latent_rank, num_heads * self.qk_head_dim, bias=False, dtype=dtype)
 
         self.proj_out = nn.Linear(num_heads * v_head_dim, dim, bias=False, dtype=dtype)
@@ -181,8 +210,6 @@ class MLA(nn.Module):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.qk_nrope_head_dim = qk_nrope_head_dim
         self.v_head_dim = v_head_dim
-
-        self.optim_type = optim_type
 
         self.register_buffer(
             "kv_latent_cache", 
@@ -212,7 +239,7 @@ class MLA(nn.Module):
         # q_rope: [batch_size, seq_len, num_heads, qk_rope_head_dim]
         if self.optim_type == "torch":
             q_rope = apply_rotary_emb(q_rope, freq_cis) # [batch_size, seq_len, num_heads, qk_rope_head_dim]
-        elif self.optim_type == "triton" or "ablation" in self.optim_type and "rope" in self.optim_type:
+        elif (self.optim_type == "triton") or ("ablation" in self.optim_type and "rope" in self.optim_type):
             q_rope = fused_apply_rotary_emb(q_rope, freq_cis)
         else: # default
             q_rope = apply_rotary_emb(q_rope, freq_cis)
@@ -223,13 +250,13 @@ class MLA(nn.Module):
         ) # kv_latent: [batch_size, seq_len, kv_latent_rank], k_rope: [batch_size, seq_len, qk_rope_head_dim]
         if self.optim_type == "torch":
             k_rope = apply_rotary_emb(k_rope.unsqueeze(2), freq_cis).squeeze(2) # [batch_size, seq_len, qk_rope_head_dim]
-        elif self.optim_type == "triton" or "ablation" in self.optim_type and "rope" in self.optim_type:
+        elif (self.optim_type == "triton") or ("ablation" in self.optim_type and "rope" in self.optim_type):
             k_rope = fused_apply_rotary_emb(k_rope.unsqueeze(2), freq_cis).squeeze(2)
         else: # default
-            q_rope = apply_rotary_emb(q_rope, freq_cis)
+            k_rope = apply_rotary_emb(k_rope.unsqueeze(2), freq_cis).squeeze(2)
 
         end_pos = start_pos + seq_len
-        self.kv_latent_cache[:batch_size, start_pos:end_pos] = kv_latent
+        self.kv_latent_cache[:batch_size, start_pos:end_pos] = self.rms_norm_kv(kv_latent)
         self.k_rope_cache[:batch_size, start_pos:end_pos] = k_rope
 
         # reshape the kv up weight, to make it be absorbed into the q
@@ -258,7 +285,7 @@ class MLA(nn.Module):
                     "blhr,btr->blht", q_rope, self.k_rope_cache[:batch_size, :end_pos]
                 )
             ) * self.softmax_scale # [batch_size, seq_len_q, num_heads, seq_len_k]
-        elif self.optim_type == "triton" or "ablation" in self.optim_type and "qk_attention" in self.optim_type:
+        elif (self.optim_type == "triton") or ("ablation" in self.optim_type and "qk_attention" in self.optim_type):
             kernel_dtype = tl.float16 if x.dtype == torch.float16 else tl.float32
             scores = fused_qk_attention(
                 q_nrope_absorb, q_rope, 
