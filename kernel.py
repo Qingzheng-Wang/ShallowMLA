@@ -364,7 +364,7 @@ def fused_qk_attention(
         triton.Config({"BLOCK_T": 128}, num_warps=4),
         triton.Config({"BLOCK_T": 64}, num_warps=4),
     ],
-    key=["BLOCK_T"]
+    # key=["BLOCK_T"]
 )
 @triton.jit
 def fused_mask_softmax_kernel(
