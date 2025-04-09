@@ -146,24 +146,6 @@ def apply_rotary_emb_origin(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.T
     y = torch.view_as_real(x * freqs_cis).flatten(3)
     return y.to(dtype)
 
-class RMSNormTriton(torch.nn.Module):
-    """
-    Root Mean Square Layer Normalization (RMSNorm) optimized using Triton.
-
-    Args:
-        dim (int): Dimension of the input tensor.
-        eps (float): Epsilon value for numerical stability. Defaults to 1e-6.
-    """
-    def __init__(self, dim: int, eps: float = 1e-6, dtype: torch.dtype = torch.float16):
-        super().__init__()
-        self.dim = dim
-        self.eps = eps
-        self.weight = torch.nn.Parameter(torch.ones(dim, dtype=dtype))
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return fused_rms_norm(x, (self.dim,), self.weight, self.eps)
-
-
 class MLA(nn.Module):
     def __init__(
         self,
@@ -177,7 +159,8 @@ class MLA(nn.Module):
         max_batch_size: int, # max batch size
         max_seq_len: int, # max sequence length
         dtype: Optional[torch.dtype] = torch.float16, # the dtype of the model
-        optim_type: str = "torch", # the type of the optimization, "torch" or "triton"
+        optim_type: str = "torch", # the type of the optimization, "torch" or "triton",
+        eps: float = 1e-6, # epsilon for RMSNorm
     ):
         super().__init__()
         
@@ -186,15 +169,6 @@ class MLA(nn.Module):
         self.qk_head_dim = qk_nrope_head_dim + qk_rope_head_dim
 
         self.proj_kv_down = nn.Linear(dim, kv_latent_rank + qk_rope_head_dim, bias=False, dtype=dtype)
-        if self.optim_type == "torch":
-            self.rms_norm_kv = nn.RMSNorm(kv_latent_rank, dtype=dtype)
-            self.rms_norm_q = nn.RMSNorm(q_latent_rank, dtype=dtype)
-        elif (self.optim_type == "triton") or (("ablation" in self.optim_type) and ("rmsnorm" in self.optim_type)):
-            self.rms_norm_kv = RMSNormTriton(kv_latent_rank, dtype=dtype)
-            self.rms_norm_q = RMSNormTriton(q_latent_rank, dtype=dtype)
-        else:
-            self.rms_norm_kv = nn.RMSNorm(kv_latent_rank, dtype=dtype)
-            self.rms_norm_q = nn.RMSNorm(q_latent_rank, dtype=dtype)
         
         self.proj_kv_up = nn.Linear(kv_latent_rank, num_heads * (qk_nrope_head_dim + v_head_dim), bias=False, dtype=dtype)
 
@@ -202,6 +176,9 @@ class MLA(nn.Module):
         self.proj_q_up = nn.Linear(q_latent_rank, num_heads * self.qk_head_dim, bias=False, dtype=dtype)
 
         self.proj_out = nn.Linear(num_heads * v_head_dim, dim, bias=False, dtype=dtype)
+        
+        self.rms_norm_kv_weight = torch.nn.Parameter(torch.ones(kv_latent_rank, dtype=dtype))
+        self.rms_norm_q_weight = torch.nn.Parameter(torch.ones(q_latent_rank, dtype=dtype))
 
         self.softmax_scale = 1.0 / self.qk_head_dim ** 0.5
         self.num_heads = num_heads
@@ -210,6 +187,8 @@ class MLA(nn.Module):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.qk_nrope_head_dim = qk_nrope_head_dim
         self.v_head_dim = v_head_dim
+        
+        self.eps = eps
 
         self.register_buffer(
             "kv_latent_cache", 
@@ -231,7 +210,13 @@ class MLA(nn.Module):
     ):
         batch_size, seq_len, dim = x.shape
         
-        q = self.proj_q_up(self.rms_norm_q(self.proj_q_down(x)))
+        q_latent = self.proj_q_down(x)
+        if self.optim_type == "triton" or ("ablation" in self.optim_type and "rmsnorm" in self.optim_type): 
+            q_latent = fused_rms_norm(q_latent, (q_latent.shape[-1],), self.rms_norm_q_weight, self.eps)
+        else:
+            q_latent = torch.nn.functional.rms_norm(q_latent, (q_latent.shape[-1],), self.rms_norm_q_weight, self.eps)
+        q = self.proj_q_up(q_latent)
+        
         q = q.view(batch_size, seq_len, self.num_heads, self.qk_head_dim)
         q_nrope, q_rope = q.split(
             [self.qk_nrope_head_dim, self.qk_rope_head_dim], dim=-1
@@ -256,7 +241,10 @@ class MLA(nn.Module):
             k_rope = apply_rotary_emb(k_rope.unsqueeze(2), freq_cis).squeeze(2)
 
         end_pos = start_pos + seq_len
-        self.kv_latent_cache[:batch_size, start_pos:end_pos] = self.rms_norm_kv(kv_latent)
+        if self.optim_type == "triton" or ("ablation" in self.optim_type and "rmsnorm" in self.optim_type): 
+            self.kv_latent_cache[:batch_size, start_pos:end_pos] = fused_rms_norm(kv_latent, (kv_latent.shape[-1], ), self.rms_norm_kv_weight, self.eps)
+        else:
+            self.kv_latent_cache[:batch_size, start_pos:end_pos] = torch.nn.functional.rms_norm(kv_latent, (kv_latent.shape[-1], ), self.rms_norm_kv_weight, self.eps)
         self.k_rope_cache[:batch_size, start_pos:end_pos] = k_rope
 
         # reshape the kv up weight, to make it be absorbed into the q
