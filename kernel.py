@@ -452,6 +452,117 @@ def fused_qk_attention(
 
     return out
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_T": 128}, num_warps=4),
+        triton.Config({"BLOCK_T": 64}, num_warps=4),
+    ],
+    key=["T"]
+)
+@triton.jit
+def fused_mask_softmax_kernel(
+    scores_ptr,         # pointer to scores, shape [B, L, H, T]
+    mask_ptr,           # pointer to mask, shape [1, L, 1, T]
+    B, L, H, T,         # dimensions of scores
+    stride_scores_b, stride_scores_l, stride_scores_h, stride_scores_t,
+    stride_mask_l, stride_mask_t,  # mask only uses strides of the l and t dimensions
+    BLOCK_T: tl.constexpr,          # number of elements processed in the T dimension per block
+):
+    # Each program processes one row, corresponding to (b, l, h)
+    pid = tl.program_id(0)
+    # Decode b, l, h from the grid size (B*L*H)
+    tmp = pid
+    b = tmp // (L * H)
+    tmp = tmp % (L * H)
+    l = tmp // H
+    h = tmp % H
+
+    # Starting address of the current row in scores
+    row_scores_ptr = scores_ptr + b * stride_scores_b + l * stride_scores_l + h * stride_scores_h
+
+    # First pass: Scan the T dimension to compute the maximum value (for numerical stability)
+    row_max = -1e9  # Using a scalar to store the maximum value directly
+    offs = tl.arange(0, BLOCK_T)
+    for start in range(0, T, BLOCK_T):
+        offs_t = start + offs
+        mask_valid = offs_t < T
+        # Load the scores tile
+        scores_tile = tl.load(
+            row_scores_ptr + offs_t * stride_scores_t,
+            mask=mask_valid,
+            other=-1e9
+        )
+        # Load the corresponding mask tile (mask shape is [1, L, 1, T], so it only relates to the l and t dimensions)
+        mask_tile = tl.load(
+            mask_ptr + l * stride_mask_l + offs_t * stride_mask_t,
+            mask=mask_valid,
+            other=0.0
+        )
+        tile = scores_tile + mask_tile
+        row_max = tl.maximum(row_max, tl.max(tile, axis=0))
+    
+    # Second pass: Compute the sum of exp(x - max)
+    row_sum = 0.0
+    for start in range(0, T, BLOCK_T):
+        offs_t = start + offs
+        mask_valid = offs_t < T
+        scores_tile = tl.load(
+            row_scores_ptr + offs_t * stride_scores_t,
+            mask=mask_valid,
+            other=-1e9
+        )
+        mask_tile = tl.load(
+            mask_ptr + l * stride_mask_l + offs_t * stride_mask_t,
+            mask=mask_valid,
+            other=0.0
+        )
+        tile = scores_tile + mask_tile
+        tile = tile - row_max
+        exp_tile = tl.exp(tile)
+        row_sum += tl.sum(exp_tile, axis=0)
+    
+    # Third pass: Normalize and write back to scores
+    for start in range(0, T, BLOCK_T):
+        offs_t = start + offs
+        mask_valid = offs_t < T
+        scores_tile = tl.load(
+            row_scores_ptr + offs_t * stride_scores_t,
+            mask=mask_valid,
+            other=-1e9
+        )
+        mask_tile = tl.load(
+            mask_ptr + l * stride_mask_l + offs_t * stride_mask_t,
+            mask=mask_valid,
+            other=0.0
+        )
+        tile = scores_tile + mask_tile
+        tile = tile - row_max
+        exp_tile = tl.exp(tile)
+        softmax_tile = exp_tile / row_sum
+        tl.store(row_scores_ptr + offs_t * stride_scores_t, softmax_tile, mask=mask_valid)
+    
+
+def fused_mask_softmax(scores: torch.Tensor, mask: torch.Tensor):
+    """
+    fused_mask_softmax: Apply mask to scores and perform softmax normalization along the last dimension.
+    scores: [B, L, H, T]
+    mask: [1, L, 1, T]
+    """
+    B, L, H, T = scores.shape
+    # Get the strides for each dimension of scores
+    stride_scores_b, stride_scores_l, stride_scores_h, stride_scores_t = scores.stride()
+    # Mask's shape is [1, L, 1, T]; only the strides for l and t dimensions are used
+    _, stride_mask_l, _, stride_mask_t = mask.stride()
+
+    # Grid size: each block processes one row, i.e., one (b, l, h)
+    grid = lambda meta: (B * L * H,)
+    fused_mask_softmax_kernel[grid](
+        scores, mask, B, L, H, T,
+        stride_scores_b, stride_scores_l, stride_scores_h, stride_scores_t,
+        stride_mask_l, stride_mask_t,
+        # BLOCK_T will be automatically selected by autotune
+    )
+
 def fused_apply_rotary_emb(
     x: torch.Tensor,
     freq_cis: torch.Tensor

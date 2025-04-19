@@ -5,7 +5,7 @@ from mla import (
 )
 import time
 from torch.profiler import profile, ProfilerActivity, schedule, tensorboard_trace_handler
-from kernel import fused_qk_attention, fused_apply_rotary_emb
+from kernel import fused_qk_attention, fused_mask_softmax, fused_apply_rotary_emb
 
 
 def test_transformer_forward():
@@ -230,6 +230,39 @@ def test_fused_qk_attention():
     print("Max abs diff:", (scores_torch - scores_triton).abs().max().item())
     print("Mean diff:", (scores_torch - scores_triton).abs().mean().item())
     print("Scores equal:", torch.allclose(scores_torch, scores_triton, rtol=1e-3, atol=1e-3))
+    
+def test_fused_mask_softmax():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Running on {device} for fused_mask_softmax test")
+
+    torch.manual_seed(42)
+
+    B = 8   # batch
+    L = 256 # seq_len_q
+    H = 16  # heads
+    T = 256 # seq_len_k
+
+    scores = torch.randn(B, L, H, T, dtype=torch.float32, device=device)
+
+    base_mask = torch.full((L, T), float('-inf'), device=device)
+    base_mask = torch.triu(base_mask, diagonal=1)
+    mask = base_mask.view(1, L, 1, T)
+
+    # Torch
+    scores_torch = scores.clone()
+    scores_torch += mask
+    scores_torch = torch.softmax(scores_torch, dim=-1)
+
+    # Triton
+    scores_triton = scores.clone()
+    fused_mask_softmax(scores_triton, mask)
+
+    abs_diff = (scores_torch - scores_triton).abs()
+    max_abs_diff = abs_diff.max().item()
+    mean_abs_diff = abs_diff.mean().item()
+
+    print(f"Max abs diff: {max_abs_diff:.6f}")
+    print(f"Mean abs diff: {mean_abs_diff:.6f}")
 
 def test_fused_apply_rotary_emb():
     B = 8         # batch size
@@ -252,7 +285,7 @@ def test_fused_apply_rotary_emb():
         print("Max abs diff:", (out_torch - out_triton).abs().max().item())
         print("Mean diff:", (out_torch - out_triton).abs().mean().item())
         print("Outputs equal:", torch.allclose(out_torch, out_triton, rtol=1e-3, atol=1e-3))
-
+        
 def benchmark_mla(batch_size=8, seq_len=1024, use_profile=False, dtype=torch.float32):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Running on {device}")
@@ -322,7 +355,7 @@ def benchmark_mla(batch_size=8, seq_len=1024, use_profile=False, dtype=torch.flo
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
         dtype=dtype,
-        optim_type="ablation:rope",
+        optim_type="triton",
     ).to(device)
 
     mla_triton.load_state_dict(mla_torch.state_dict()) # ensure weights are the same
@@ -403,7 +436,7 @@ def benchmark():
             ) = benchmark_mla(
                 batch_size=batch_size, 
                 seq_len=seq_len, 
-                use_profile=False, 
+                use_profile=True, 
                 dtype=torch.float32 # FLOAT16 IS BUG!!!!!!!!!!!!
             )
             results[(batch_size, seq_len)] = (
@@ -466,3 +499,4 @@ if __name__ == "__main__":
     # test_fused_qk_attention()
     # test_rope()
     # test_fused_apply_rotary_emb()
+    # test_fused_mask_softmax()
