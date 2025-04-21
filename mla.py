@@ -6,6 +6,7 @@ import triton.language as tl
 
 from typing import Optional
 from kernel import fused_qk_attention, fused_apply_rotary_emb, fused_rms_norm, fused_mask_softmax
+from cache_manager import PageAttentionCacheManager
 
 
 def precompute_freqs_cis(
@@ -160,6 +161,8 @@ class MLA(nn.Module):
         dtype: Optional[torch.dtype] = torch.float16, # the dtype of the model
         optim_type: str = "torch", # the type of the optimization, "torch" or "triton",
         eps: float = 1e-6, # epsilon for RMSNorm
+        use_page_cache: bool = False,
+        page_size: int = 128,
     ):
         super().__init__()
         
@@ -188,17 +191,42 @@ class MLA(nn.Module):
         self.v_head_dim = v_head_dim
         
         self.eps = eps
+        self.use_page_cache = use_page_cache
+        
+        if not use_page_cache:
+            self.register_buffer(
+                "kv_latent_cache", 
+                torch.zeros(max_batch_size, max_seq_len, kv_latent_rank, dtype=dtype), 
+                persistent=False
+            )
+            self.register_buffer(
+                "k_rope_cache", 
+                torch.zeros(max_batch_size, max_seq_len, qk_rope_head_dim, dtype=dtype),
+                persistent=False
+            )
+        else:
+            num_pages = math.ceil(max_batch_size * max_seq_len / page_size * 1.1)
+            
+            self.cache_manager = PageAttentionCacheManager(
+                batch_size=max_batch_size,
+                page_size=page_size,
+                num_pages=num_pages,
+                kv_latent_rank=kv_latent_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                dtype=dtype,
+                device='cuda',
+            )
 
-        self.register_buffer(
-            "kv_latent_cache", 
-            torch.zeros(max_batch_size, max_seq_len, kv_latent_rank, dtype=dtype), 
-            persistent=False # the buffer will not be saved in the state dict
-        )
-        self.register_buffer(
-            "k_rope_cache", 
-            torch.zeros(max_batch_size, max_seq_len, qk_rope_head_dim, dtype=dtype),
-            persistent=False
-        )
+            self.register_buffer(
+                "kv_latent_cache_ref", 
+                torch.zeros(1, 1, 1, dtype=dtype), 
+                persistent=False
+            )
+            self.register_buffer(
+                "k_rope_cache_ref", 
+                torch.zeros(1, 1, 1, dtype=dtype),
+                persistent=False
+            )
     
     def forward(
         self, 
@@ -241,10 +269,21 @@ class MLA(nn.Module):
 
         end_pos = start_pos + seq_len
         if self.optim_type == "triton" or ("ablation" in self.optim_type and "rmsnorm" in self.optim_type): 
-            self.kv_latent_cache[:batch_size, start_pos:end_pos] = fused_rms_norm(kv_latent, (kv_latent.shape[-1], ), self.rms_norm_kv_weight, self.eps)
+            normalized_kv_latent = fused_rms_norm(kv_latent, (kv_latent.shape[-1], ), self.rms_norm_kv_weight, self.eps)
         else:
-            self.kv_latent_cache[:batch_size, start_pos:end_pos] = torch.nn.functional.rms_norm(kv_latent, (kv_latent.shape[-1], ), self.rms_norm_kv_weight, self.eps)
-        self.k_rope_cache[:batch_size, start_pos:end_pos] = k_rope
+            normalized_kv_latent = torch.nn.functional.rms_norm(kv_latent, (kv_latent.shape[-1], ), self.rms_norm_kv_weight, self.eps)
+            
+        if self.use_page_cache:
+            for b_idx in range(batch_size):
+                self.cache_manager.update(
+                    batch_idx=b_idx,
+                    start_pos=start_pos,
+                    kv_latent=normalized_kv_latent[b_idx],
+                    k_rope=k_rope[b_idx]
+                )
+        else:
+            self.kv_latent_cache[:batch_size, start_pos:end_pos] = normalized_kv_latent
+            self.k_rope_cache[:batch_size, start_pos:end_pos] = k_rope
 
         # reshape the kv up weight, to make it be absorbed into the q
         proj_kv_up_weight = self.proj_kv_up.weight # [num_heads * (qk_nrope_head_dim + v_head_dim, kv_latent_rank]
@@ -263,31 +302,52 @@ class MLA(nn.Module):
             "blhd,hdk->blhk", q_nrope, proj_kv_up_weight_q_nrope_absorbed
         ) # [batch_size, seq_len, num_heads, kv_latent_rank]
 
-        if self.optim_type == "torch":
-            scores = (
-                torch.einsum(
-                    "blhk,btk->blht", q_nrope_absorb, self.kv_latent_cache[:batch_size, :end_pos]
-                ) + 
-                torch.einsum(
-                    "blhr,btr->blht", q_rope, self.k_rope_cache[:batch_size, :end_pos]
+        if self.use_page_cache:
+            # first retrieve all cache data and stack them into a single tensor
+            all_kv_latent = []
+            all_k_rope = []
+            
+            for b_idx in range(batch_size):
+                batch_kv_latent, batch_k_rope = self.cache_manager.retrieve_key_value_states(
+                    batch_idx=b_idx,
+                    start_pos=0,
+                    end_pos=end_pos
                 )
-            ) * self.softmax_scale # [batch_size, seq_len_q, num_heads, seq_len_k]
-        elif (self.optim_type == "triton") or ("ablation" in self.optim_type and "qk_attention" in self.optim_type):
-            kernel_dtype = tl.float16 if x.dtype == torch.float16 else tl.float32
-            scores = fused_qk_attention(
-                q_nrope_absorb, q_rope, 
-                self.kv_latent_cache[:batch_size, :end_pos], self.k_rope_cache[:batch_size, :end_pos],
-                self.softmax_scale, kernel_version=2, dtype=kernel_dtype
-            )
+                all_kv_latent.append(batch_kv_latent)
+                all_k_rope.append(batch_k_rope)
+            
+            stacked_kv_latent = torch.stack(all_kv_latent, dim=0) # [batch_size, seq_len, kv_latent_rank]
+            stacked_k_rope = torch.stack(all_k_rope, dim=0)  # [batch_size, seq_len, qk_rope_head_dim]
+            
+            if (self.optim_type == "triton") or ("ablation" in self.optim_type and "qk_attention" in self.optim_type):
+                kernel_dtype = tl.float16 if x.dtype == torch.float16 else tl.float32
+                scores = fused_qk_attention(
+                    q_nrope_absorb, q_rope, 
+                    stacked_kv_latent, stacked_k_rope,
+                    self.softmax_scale, kernel_version=2, dtype=kernel_dtype
+                )
+            else:
+                scores = (
+                    torch.einsum("blhk,btk->blht", q_nrope_absorb, stacked_kv_latent) + 
+                    torch.einsum("blhr,btr->blht", q_rope, stacked_k_rope)
+                ) * self.softmax_scale
         else:
-            scores = (
-                torch.einsum(
-                    "blhk,btk->blht", q_nrope_absorb, self.kv_latent_cache[:batch_size, :end_pos]
-                ) + 
-                torch.einsum(
-                    "blhr,btr->blht", q_rope, self.k_rope_cache[:batch_size, :end_pos]
+            if (self.optim_type == "triton") or ("ablation" in self.optim_type and "qk_attention" in self.optim_type):
+                kernel_dtype = tl.float16 if x.dtype == torch.float16 else tl.float32
+                scores = fused_qk_attention(
+                    q_nrope_absorb, q_rope, 
+                    self.kv_latent_cache[:batch_size, :end_pos], self.k_rope_cache[:batch_size, :end_pos],
+                    self.softmax_scale, kernel_version=2, dtype=kernel_dtype
                 )
-            ) * self.softmax_scale # [batch_size, seq_len_q, num_heads, seq_len_k]
+            else:
+                scores = (
+                    torch.einsum(
+                        "blhk,btk->blht", q_nrope_absorb, self.kv_latent_cache[:batch_size, :end_pos]
+                    ) + 
+                    torch.einsum(
+                        "blhr,btr->blht", q_rope, self.k_rope_cache[:batch_size, :end_pos]
+                    )
+                ) * self.softmax_scale # [batch_size, seq_len_q, num_heads, seq_len_k]
 
         # mask the scores
         if mask is not None:
@@ -304,9 +364,15 @@ class MLA(nn.Module):
 
         # matmul cache first, then upsample the v, this reduces the computation, otherwise
         # matmul on the upsampled v, which is much higher dimensional
-        x = torch.einsum(
-            "blht,btk->blhk", scores, self.kv_latent_cache[:batch_size, :end_pos]
-        )
+        if self.use_page_cache:
+            # reuse the already stacked kv_latent from the previous step
+            x = torch.einsum(
+                "blht,btk->blhk", scores, stacked_kv_latent
+            )
+        else:
+            x = torch.einsum(
+                "blht,btk->blhk", scores, self.kv_latent_cache[:batch_size, :end_pos]
+            )
         proj_kv_up_weight_v = proj_kv_up_weight[:, -self.v_head_dim:, :]
         x = torch.einsum(
             "blhk,hdk->blhd", x, proj_kv_up_weight_v
