@@ -140,7 +140,8 @@ def test_mla_triton():
     print(f"Running on {device}")
 
     torch.manual_seed(42)
-
+    dtype = torch.float16
+    
     dim = 2048
     num_heads = 16
     kv_latent_rank = 512
@@ -161,7 +162,7 @@ def test_mla_triton():
         qk_rope_head_dim=qk_rope_head_dim,
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
-        dtype=torch.float32,
+        dtype=dtype,
         optim_type="torch",
     ).to(device)
 
@@ -175,7 +176,7 @@ def test_mla_triton():
         qk_rope_head_dim=qk_rope_head_dim,
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
-        dtype=torch.float32,
+        dtype=dtype,
         optim_type="triton",
     ).to(device)
 
@@ -183,7 +184,7 @@ def test_mla_triton():
 
     batch_size = 8
     seq_len = 1024
-    x = torch.randn(batch_size, seq_len, dim, dtype=torch.float32).to(device)
+    x = torch.randn(batch_size, seq_len, dim, dtype=dtype).to(device)
 
     start_pos = 0
     freq_cis = precompute_freqs_cis(
@@ -436,8 +437,8 @@ def benchmark():
             ) = benchmark_mla(
                 batch_size=batch_size, 
                 seq_len=seq_len, 
-                use_profile=True, 
-                dtype=torch.float32 # FLOAT16 IS BUG!!!!!!!!!!!!
+                use_profile=False, 
+                dtype=torch.float16
             )
             results[(batch_size, seq_len)] = (
                 avg_time_torch, 

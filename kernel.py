@@ -251,7 +251,7 @@ def fused_qk_attention_kernel_2(
     mask_l = offs_l < L
     mask_t = offs_t < T
 
-    accumulator = tl.zeros((BLOCK_L, BLOCK_T), dtype=dtype)
+    accumulator = tl.zeros((BLOCK_L, BLOCK_T), dtype=tl.float32)
 
     # q_nrope_absorb kv_latent_cache
     for k_off in range(0, K, BLOCK_K):
