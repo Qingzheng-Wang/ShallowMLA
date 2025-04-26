@@ -286,6 +286,19 @@ def test_fused_apply_rotary_emb():
         print("Max abs diff:", (out_torch - out_triton).abs().max().item())
         print("Mean diff:", (out_torch - out_triton).abs().mean().item())
         print("Outputs equal:", torch.allclose(out_torch, out_triton, rtol=1e-3, atol=1e-3))
+
+def test_rope():
+    # test if two version of apply_rotary_emb are the same
+    # the origin is input with freqs_cis as complex
+    # the new one is input with freqs as real and imag
+    x = torch.randn(2, 4, 4, 4)
+    freqs = torch.randn(4, 2, 2)
+    freqs_complex = torch.view_as_complex(freqs)
+    from mla import apply_rotary_emb, apply_rotary_emb_origin
+    out = apply_rotary_emb(x, freqs)
+    out_origin = apply_rotary_emb_origin(x, freqs_complex)
+    if torch.allclose(out, out_origin):
+        print("✅ RoPE test passed.")
         
 def benchmark_mla(batch_size=8, seq_len=1024, use_profile=False, dtype=torch.float32):
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -313,6 +326,8 @@ def benchmark_mla(batch_size=8, seq_len=1024, use_profile=False, dtype=torch.flo
         max_seq_len=max_seq_len,
         dtype=dtype,
         optim_type="torch",
+        use_page_cache=True,
+        page_size=1024,
     ).to(device)
     mla_torch.eval()
 
@@ -357,6 +372,8 @@ def benchmark_mla(batch_size=8, seq_len=1024, use_profile=False, dtype=torch.flo
         max_seq_len=max_seq_len,
         dtype=dtype,
         optim_type="triton",
+        use_page_cache=True,
+        page_size=1024,
     ).to(device)
 
     mla_triton.load_state_dict(mla_torch.state_dict()) # ensure weights are the same
@@ -417,6 +434,16 @@ def benchmark_mla(batch_size=8, seq_len=1024, use_profile=False, dtype=torch.flo
     throughput_triton = (batch_size * seq_len) / avg_time_triton
     print(f"Throughput Torch: {throughput_torch:.2f} tokens/sec")
     print(f"Throughput Triton: {throughput_triton:.2f} tokens/sec")
+    if mla_torch.use_page_cache:
+        print("MLA Torch page cache stats:")
+        print(f"Page cache size: {mla_torch.page_size}")
+        for key, value in mla_torch.cache_manager.get_memory_usage().items():
+            print(f"{key}: {value}")
+    if mla_triton.use_page_cache:
+        print("MLA Triton page cache stats:")
+        print(f"Page cache size: {mla_triton.page_size}")
+        for key, value in mla_triton.cache_manager.get_memory_usage().items():
+            print(f"{key}: {value}")
 
     return avg_time_torch, avg_time_triton, throughput_torch, throughput_triton
 
@@ -476,19 +503,6 @@ def benchmark():
     plt.xscale("log")
     plt.yscale("log")
     plt.savefig("throughput_comparison.png")
-
-def test_rope():
-    # test if two version of apply_rotary_emb are the same
-    # the origin is input with freqs_cis as complex
-    # the new one is input with freqs as real and imag
-    x = torch.randn(2, 4, 4, 4)
-    freqs = torch.randn(4, 2, 2)
-    freqs_complex = torch.view_as_complex(freqs)
-    from mla import apply_rotary_emb, apply_rotary_emb_origin
-    out = apply_rotary_emb(x, freqs)
-    out_origin = apply_rotary_emb_origin(x, freqs_complex)
-    if torch.allclose(out, out_origin):
-        print("✅ RoPE test passed.")
 
 if __name__ == "__main__":
     # test_transformer_forward()

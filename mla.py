@@ -169,14 +169,10 @@ class MLA(nn.Module):
         self.optim_type = optim_type
         
         self.qk_head_dim = qk_nrope_head_dim + qk_rope_head_dim
-
         self.proj_kv_down = nn.Linear(dim, kv_latent_rank + qk_rope_head_dim, bias=False, dtype=dtype)
-        
         self.proj_kv_up = nn.Linear(kv_latent_rank, num_heads * (qk_nrope_head_dim + v_head_dim), bias=False, dtype=dtype)
-
         self.proj_q_down = nn.Linear(dim, q_latent_rank, bias=False, dtype=dtype)
         self.proj_q_up = nn.Linear(q_latent_rank, num_heads * self.qk_head_dim, bias=False, dtype=dtype)
-
         self.proj_out = nn.Linear(num_heads * v_head_dim, dim, bias=False, dtype=dtype)
         
         self.rms_norm_kv_weight = torch.nn.Parameter(torch.ones(kv_latent_rank, dtype=dtype))
@@ -192,6 +188,7 @@ class MLA(nn.Module):
         
         self.eps = eps
         self.use_page_cache = use_page_cache
+        self.page_size = page_size
         
         if not use_page_cache:
             self.register_buffer(
@@ -308,7 +305,7 @@ class MLA(nn.Module):
             all_k_rope = []
             
             for b_idx in range(batch_size):
-                batch_kv_latent, batch_k_rope = self.cache_manager.retrieve_key_value_states(
+                batch_kv_latent, batch_k_rope = self.cache_manager.retrieve(
                     batch_idx=b_idx,
                     start_pos=0,
                     end_pos=end_pos

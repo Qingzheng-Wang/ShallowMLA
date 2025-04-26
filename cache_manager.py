@@ -154,14 +154,7 @@ class PageAttentionCacheManager:
                 k_rope[i] = self.k_rope_pages[physical_page_idx, offset_in_page]
         
         return kv_latent, k_rope
-    
-    def retrieve_key_value_states(
-        self,
-        batch_idx: int,
-        start_pos: int,
-        end_pos: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.retrieve(batch_idx, start_pos, end_pos)
+
     
     def clear_batch(self, batch_idx: int):
         """
