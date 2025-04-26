@@ -162,6 +162,7 @@ class MLA(nn.Module):
         optim_type: str = "torch", # the type of the optimization, "torch" or "triton",
         eps: float = 1e-6, # epsilon for RMSNorm
         use_page_cache: bool = False,
+        use_page_cache_triton: bool = False,
         page_size: int = 128,
     ):
         super().__init__()
@@ -188,6 +189,7 @@ class MLA(nn.Module):
         
         self.eps = eps
         self.use_page_cache = use_page_cache
+        self.use_page_cache_triton = use_page_cache_triton
         self.page_size = page_size
         
         if not use_page_cache:
@@ -210,20 +212,12 @@ class MLA(nn.Module):
                 num_pages=num_pages,
                 kv_latent_rank=kv_latent_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
+                max_seq_len=max_seq_len,
+                use_triton=use_page_cache_triton,
                 dtype=dtype,
                 device='cuda',
             )
 
-            self.register_buffer(
-                "kv_latent_cache_ref", 
-                torch.zeros(1, 1, 1, dtype=dtype), 
-                persistent=False
-            )
-            self.register_buffer(
-                "k_rope_cache_ref", 
-                torch.zeros(1, 1, 1, dtype=dtype),
-                persistent=False
-            )
     
     def forward(
         self, 
@@ -271,13 +265,20 @@ class MLA(nn.Module):
             normalized_kv_latent = torch.nn.functional.rms_norm(kv_latent, (kv_latent.shape[-1], ), self.rms_norm_kv_weight, self.eps)
             
         if self.use_page_cache:
-            for b_idx in range(batch_size):
-                self.cache_manager.update(
-                    batch_idx=b_idx,
-                    start_pos=start_pos,
-                    kv_latent=normalized_kv_latent[b_idx],
-                    k_rope=k_rope[b_idx]
+            if self.use_page_cache_triton:
+                self.cache_manager.update_batch(
+                    start_pos,
+                    normalized_kv_latent,
+                    k_rope
                 )
+            else:
+                for b_idx in range(batch_size):
+                    self.cache_manager.update(
+                        batch_idx=b_idx,
+                        start_pos=start_pos,
+                        kv_latent=normalized_kv_latent[b_idx],
+                        k_rope=k_rope[b_idx]
+                    )
         else:
             self.kv_latent_cache[:batch_size, start_pos:end_pos] = normalized_kv_latent
             self.k_rope_cache[:batch_size, start_pos:end_pos] = k_rope
@@ -301,20 +302,27 @@ class MLA(nn.Module):
 
         if self.use_page_cache:
             # first retrieve all cache data and stack them into a single tensor
-            all_kv_latent = []
-            all_k_rope = []
             
-            for b_idx in range(batch_size):
-                batch_kv_latent, batch_k_rope = self.cache_manager.retrieve(
-                    batch_idx=b_idx,
-                    start_pos=0,
-                    end_pos=end_pos
+            if self.use_page_cache_triton:
+                stacked_kv_latent, stacked_k_rope = self.cache_manager.retrieve_batch(
+                    batch_size,
+                    start_pos,
+                    end_pos
                 )
-                all_kv_latent.append(batch_kv_latent)
-                all_k_rope.append(batch_k_rope)
+            else:
+                all_kv_latent = []
+                all_k_rope = []
+                for b_idx in range(batch_size):
+                    batch_kv_latent, batch_k_rope = self.cache_manager.retrieve(
+                        batch_idx=b_idx,
+                        start_pos=0,
+                        end_pos=end_pos
+                    )
+                    all_kv_latent.append(batch_kv_latent)
+                    all_k_rope.append(batch_k_rope)
             
-            stacked_kv_latent = torch.stack(all_kv_latent, dim=0) # [batch_size, seq_len, kv_latent_rank]
-            stacked_k_rope = torch.stack(all_k_rope, dim=0)  # [batch_size, seq_len, qk_rope_head_dim]
+                stacked_kv_latent = torch.stack(all_kv_latent, dim=0) # [batch_size, seq_len, kv_latent_rank]
+                stacked_k_rope = torch.stack(all_k_rope, dim=0)  # [batch_size, seq_len, qk_rope_head_dim]
             
             if (self.optim_type == "triton") or ("ablation" in self.optim_type and "qk_attention" in self.optim_type):
                 kernel_dtype = tl.float16 if x.dtype == torch.float16 else tl.float32

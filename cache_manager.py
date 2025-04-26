@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 from typing import Dict, List, Tuple, Optional, Set
+from kernel import page_cache_update_kernel, page_cache_retrieve_kernel
 
 
 class PageAttentionCacheManager:
@@ -15,6 +16,8 @@ class PageAttentionCacheManager:
         num_pages: int,  # Total number of pages in the cache
         kv_latent_rank: int,
         qk_rope_head_dim: int,
+        max_seq_len: int = 4096 * 4,
+        use_triton: bool = False,
         dtype: torch.dtype = torch.float16,
         device: torch.device = torch.device("cuda"),
     ):
@@ -25,6 +28,7 @@ class PageAttentionCacheManager:
         self.qk_rope_head_dim = qk_rope_head_dim
         self.dtype = dtype
         self.device = device
+        self.use_triton = use_triton
         
         # Allocate physical cache memory as pages
         self.kv_latent_pages = torch.zeros(
@@ -38,7 +42,17 @@ class PageAttentionCacheManager:
         
         # Initialize page tables
         # Structure: {batch_idx: {logical_page_idx: physical_page_idx}}
-        self.page_tables: Dict[int, Dict[int, int]] = {i: {} for i in range(batch_size)}
+        if self.use_triton:
+            # For triton, store the page table in tensor format for faster access
+            # NOTE: max_num_logical_page is the max number of logical pages could be
+            # allocated for a sequence with max_seq_len
+            self.max_num_logical_page = (max_seq_len + page_size - 1) // page_size
+            self.page_tables = torch.full(
+                (batch_size, self.max_num_logical_page), -1,
+                dtype=torch.int32, device=device
+            )
+        else:
+            self.page_tables: Dict[int, Dict[int, int]] = {i: {} for i in range(batch_size)}
         
         # Track free pages
         self.free_pages: Set[int] = set(range(num_pages))
@@ -52,7 +66,8 @@ class PageAttentionCacheManager:
     
     def _logical_to_physical(self, batch_idx: int, seq_pos: int) -> Tuple[int, int]:
         """
-        Convert logical sequence position to physical page and offset
+        Convert logical sequence position to physical page and offset, for tokens not 
+        in the table, allocate page and add to the table.
         
         Args:
             batch_idx: Index of the batch
@@ -78,6 +93,26 @@ class PageAttentionCacheManager:
         
         return physical_page_idx, offset_in_page
     
+    def _logical_to_physical_triton(self, batch_idx: int, seq_pos: int) -> Tuple[int, int]:
+        """
+        For triton, we use tensor format for page table, so the logical to physical is different. 
+        """
+        logical_page_idx = seq_pos // self.page_size
+        offset_in_page = seq_pos % self.page_size
+        
+        if self.page_tables[batch_idx, logical_page_idx] == -1:
+            if not self.free_pages:
+                raise RuntimeError("Cache out of memory: no free pages available")
+            
+            physical_page_idx = self.free_pages.pop()
+            self.page_tables[batch_idx, logical_page_idx] = physical_page_idx
+            self.batch_to_pages[batch_idx].append(physical_page_idx)
+        else:
+            physical_page_idx = self.page_tables[batch_idx, logical_page_idx]
+
+        return physical_page_idx, offset_in_page
+
+
     def update(
         self, 
         batch_idx: int, 
@@ -110,6 +145,48 @@ class PageAttentionCacheManager:
             self.kv_latent_pages[physical_page_idx, offset_in_page] = kv_latent[i]
             self.k_rope_pages[physical_page_idx, offset_in_page] = k_rope[i]
     
+    def update_batch(
+        self,
+        start_pos: int,
+        kv_latent: torch.Tensor,
+        k_rope: torch.Tensor,
+    ):
+        """
+        Update the cache with new KV data for a batch, this use triton kernel to speed up. 
+        """
+        batch_size, seq_len, kv_latent_rank = kv_latent.shape
+        _, _, qk_rope_head_dim = k_rope.shape
+        page_size = kv_latent.shape[1]
+        end_pos = start_pos + seq_len
+        for batch_idx in range(batch_size):
+            if end_pos > self.max_seq_len_per_batch[batch_idx]:
+                self.max_seq_len_per_batch[batch_idx] = end_pos
+
+        # This cannot be written into the triton kernel, 
+        # because the parralel allocate page will cause the page table to be inconsistent.
+        for batch_idx in range(batch_size):
+            for seq_pos in range(start_pos, end_pos):
+                _, _ = self._logical_to_physical_triton(batch_idx, seq_pos)
+
+        grid = lambda meta: (
+            batch_size,
+            seq_len,
+        )
+        
+        page_cache_update_kernel[grid](
+            kv_latent, # [B, T, K]
+            k_rope, # [B, T, R]
+            self.page_tables, # (batch_size, max_num_logical_pages)
+            self.kv_latent_pages, 
+            self.k_rope_pages,
+            seq_len,
+            self.max_num_logical_page,
+            page_size,
+            kv_latent_rank,
+            qk_rope_head_dim,
+            start_pos,
+        )
+
     def retrieve(
         self, 
         batch_idx: int, 
@@ -155,6 +232,44 @@ class PageAttentionCacheManager:
         
         return kv_latent, k_rope
 
+    def retrieve_batch(
+        self,
+        batch_size: int,
+        start_pos: int,
+        end_pos: int,
+    ):
+        seq_len = end_pos - start_pos
+
+        # Initialize output tensors
+        kv_latent = torch.zeros(
+            batch_size, seq_len, self.kv_latent_rank, 
+            dtype=self.dtype, device=self.device
+        )
+        k_rope = torch.zeros(
+            batch_size, seq_len, self.qk_rope_head_dim, 
+            dtype=self.dtype, device=self.device
+        )
+
+        grid = lambda meta: (
+            batch_size,
+            seq_len,
+        )
+
+        page_cache_retrieve_kernel[grid](
+            self.kv_latent_pages,
+            self.k_rope_pages,
+            self.page_tables,
+            kv_latent,
+            k_rope,
+            seq_len,
+            self.max_num_logical_page,
+            self.page_size,
+            self.kv_latent_rank,
+            self.qk_rope_head_dim,
+            start_pos
+        )
+        
+        return kv_latent, k_rope
     
     def clear_batch(self, batch_idx: int):
         """

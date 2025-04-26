@@ -299,6 +299,81 @@ def test_rope():
     out_origin = apply_rotary_emb_origin(x, freqs_complex)
     if torch.allclose(out, out_origin):
         print("✅ RoPE test passed.")
+
+def test_mla_cache_manager_triton():
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Running on {device}")
+
+    torch.manual_seed(42)
+    dtype = torch.float16
+    
+    dim = 2048
+    num_heads = 16
+    kv_latent_rank = 512
+    q_latent_rank = 512
+    qk_nrope_head_dim = 128
+    qk_rope_head_dim = 64
+    v_head_dim = 128
+    max_batch_size = 8
+    max_seq_len = 4096 * 4
+
+    mla_triton = MLA(
+        dim=dim,
+        kv_latent_rank=kv_latent_rank,
+        q_latent_rank=q_latent_rank,
+        num_heads=num_heads,
+        qk_nrope_head_dim=qk_nrope_head_dim,
+        v_head_dim=v_head_dim,
+        qk_rope_head_dim=qk_rope_head_dim,
+        max_batch_size=max_batch_size,
+        max_seq_len=max_seq_len,
+        dtype=dtype,
+        optim_type="triton", # ablation:rmsnorm:rope:qk_attention
+        use_page_cache=True,
+        use_page_cache_triton=False,
+        page_size=1024,
+    ).to(device)
+
+    mla_triton_optim_page_cache = MLA(
+        dim=dim,
+        kv_latent_rank=kv_latent_rank,
+        q_latent_rank=q_latent_rank,
+        num_heads=num_heads,
+        qk_nrope_head_dim=qk_nrope_head_dim,
+        v_head_dim=v_head_dim,
+        qk_rope_head_dim=qk_rope_head_dim,
+        max_batch_size=max_batch_size,
+        max_seq_len=max_seq_len,
+        dtype=dtype,
+        optim_type="triton", # ablation:rmsnorm:rope:qk_attention
+        use_page_cache=True,
+        use_page_cache_triton=True,
+        page_size=1024,
+    ).to(device)
+
+    mla_triton_optim_page_cache.load_state_dict(mla_triton.state_dict())
+
+    batch_size = 8
+    seq_len = 1024
+    x = torch.randn(batch_size, seq_len, dim, dtype=dtype).to(device)
+
+    start_pos = 0
+    freq_cis = precompute_freqs_cis(
+        qk_rope_head_dim, max_seq_len, seq_len, beta_fast=32, beta_slow=1,
+        rope_theta=10000.0, rope_factor=40.0
+    ).to(device)[start_pos: start_pos + seq_len]
+
+    mask = torch.full((seq_len, seq_len), float("-inf"), device=device).triu_(1)
+
+    result_triton = mla_triton(x, start_pos, freq_cis, mask)
+    result_triton_optim_page_cache = mla_triton_optim_page_cache(x, start_pos, freq_cis, mask)
+
+    diff = torch.norm(result_triton - result_triton_optim_page_cache).item()
+    if diff < 1e-4:
+        print("✅ Triton and Triton with optim cache results match.")
+    else:
+        print(f"❌ Triton and Triton with optim cache results differ: {diff:.6f}")
         
 def benchmark_mla(batch_size=8, seq_len=1024, use_profile=False, dtype=torch.float32):
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -359,6 +434,7 @@ def benchmark_mla(batch_size=8, seq_len=1024, use_profile=False, dtype=torch.flo
     end = time.time()
     avg_time_torch = (end - start) / 10
 
+    # ========== MLA with paged cache, but not triton optimized =========
 
     mla_triton = MLA(
         dim=dim,
@@ -373,6 +449,7 @@ def benchmark_mla(batch_size=8, seq_len=1024, use_profile=False, dtype=torch.flo
         dtype=dtype,
         optim_type="triton",
         use_page_cache=True,
+        use_page_cache_triton=False,
         page_size=1024,
     ).to(device)
 
@@ -427,22 +504,70 @@ def benchmark_mla(batch_size=8, seq_len=1024, use_profile=False, dtype=torch.flo
                 prof.step()
         print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))
 
+    # ========== MLA with triton optimized paged cache =========
+
+    mla_triton_optim_page_cache = MLA(
+        dim=dim,
+        kv_latent_rank=kv_latent_rank,
+        q_latent_rank=q_latent_rank,
+        num_heads=num_heads,
+        qk_nrope_head_dim=qk_nrope_head_dim,
+        v_head_dim=v_head_dim,
+        qk_rope_head_dim=qk_rope_head_dim,
+        max_batch_size=max_batch_size,
+        max_seq_len=max_seq_len,
+        dtype=dtype,
+        optim_type="triton",
+        use_page_cache=True,
+        use_page_cache_triton=True,
+        page_size=1024,
+    ).to(device)
+
+    mla_triton_optim_page_cache.load_state_dict(mla_torch.state_dict()) # ensure weights are the same
+    mla_triton_optim_page_cache.eval()
+
+    torch.cuda.empty_cache() if device == "cuda" else None
+    # warmup
+    with torch.inference_mode():
+        for _ in range(5):
+            _ = mla_triton_optim_page_cache(x, start_pos, freq_cis, mask)
+
+    torch.cuda.empty_cache() if device == "cuda" else None
+    torch.cuda.synchronize() if device == "cuda" else None
+    start = time.time()
+
+    # torch profiler benchmark
+    with torch.inference_mode():
+        for _ in range(10):
+            _ = mla_triton_optim_page_cache(x, start_pos, freq_cis, mask)
+
+    torch.cuda.synchronize() if device == "cuda" else None
+    end = time.time()
+    avg_time_triton_optim_page_cache = (end - start) / 10
 
     print(f"MLA Torch forward average time: {avg_time_torch:.4f} seconds")
     print(f"MLA Triton forward average time: {avg_time_triton:.4f} seconds")
+    print(f"MLA Triton optimized page cache forward average time: {avg_time_triton_optim_page_cache:.4f} seconds")
     throughput_torch = (batch_size * seq_len) / avg_time_torch
     throughput_triton = (batch_size * seq_len) / avg_time_triton
+    throughput_triton_optim_page_cache = (batch_size * seq_len) / avg_time_triton_optim_page_cache
     print(f"Throughput Torch: {throughput_torch:.2f} tokens/sec")
     print(f"Throughput Triton: {throughput_triton:.2f} tokens/sec")
+    print(f"Throughput Triton optimized page cache: {throughput_triton_optim_page_cache:.2f} tokens/sec")
     if mla_torch.use_page_cache:
-        print("MLA Torch page cache stats:")
+        print("=========MLA Torch page cache stats=========")
         print(f"Page cache size: {mla_torch.page_size}")
         for key, value in mla_torch.cache_manager.get_memory_usage().items():
             print(f"{key}: {value}")
     if mla_triton.use_page_cache:
-        print("MLA Triton page cache stats:")
+        print("=========MLA Triton page cache stats (Non-Triton page cache)=========")
         print(f"Page cache size: {mla_triton.page_size}")
         for key, value in mla_triton.cache_manager.get_memory_usage().items():
+            print(f"{key}: {value}")
+    if mla_triton_optim_page_cache.use_page_cache:
+        print("=========MLA Triton page cache stats (Triton page cache)=========")
+        print(f"Page cache size: {mla_triton_optim_page_cache.page_size}")
+        for key, value in mla_triton_optim_page_cache.cache_manager.get_memory_usage().items():
             print(f"{key}: {value}")
 
     return avg_time_torch, avg_time_triton, throughput_torch, throughput_triton
@@ -515,3 +640,4 @@ if __name__ == "__main__":
     # test_rope()
     # test_fused_apply_rotary_emb()
     # test_fused_mask_softmax()
+    # test_mla_cache_manager_triton()

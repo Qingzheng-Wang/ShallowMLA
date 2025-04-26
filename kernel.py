@@ -2,6 +2,8 @@ import triton
 import triton.language as tl
 import torch
 
+# =================== qk_attention ========================
+
 @triton.autotune(
     configs=[
         triton.Config(
@@ -307,6 +309,59 @@ def fused_qk_attention_kernel_2(
         mask=mask_l[:, None] & mask_t[None, :],
     )
 
+def fused_qk_attention(
+    q_nrope_absorb: torch.Tensor, 
+    q_rope: torch.Tensor, 
+    kv_latent_cache: torch.Tensor, 
+    k_rope_cache: torch.Tensor,
+    softmax_scale: float,
+    kernel_version: int = 1,
+    dtype: tl.constexpr = tl.float32,
+): 
+
+    B, L, H, K = q_nrope_absorb.shape
+    _, T, R = k_rope_cache.shape
+    out = torch.empty((B, L, H, T), dtype=q_nrope_absorb.dtype, device=q_nrope_absorb.device)
+
+    if kernel_version == 1:
+        grid = lambda meta: (
+            triton.cdiv(L, meta["BLOCK_L"]), 
+            triton.cdiv(T, meta["BLOCK_T"]),
+            B, # batch size
+        )
+        kernel_func = fused_qk_attention_kernel
+    elif kernel_version == 2:
+        grid = lambda meta: (
+            triton.cdiv(L, meta["BLOCK_L"]), 
+            triton.cdiv(T, meta["BLOCK_T"]),
+            B * H, # batch size * num_heads
+        )
+        kernel_func = fused_qk_attention_kernel_2
+
+    kernel_func[grid](
+        q_nrope_absorb,
+        q_rope,
+        kv_latent_cache,
+        k_rope_cache,
+        out,
+        B, L, H, K, R, T,
+        *q_nrope_absorb.stride(),
+        *q_rope.stride(),
+        *kv_latent_cache.stride(),
+        *k_rope_cache.stride(),
+        *out.stride(),
+        softmax_scale, 
+        # BLOCK_L=32,
+        # BLOCK_T=32,
+        # BLOCK_K=32,
+        # BLOCK_R=32,
+        dtype=dtype,
+    ) # the block sizes is tuned by autotune
+
+    return out
+
+# =================== apply_rotary_emb ========================
+
 @triton.autotune(
     configs=[
         triton.Config(
@@ -401,56 +456,31 @@ def fused_apply_rotary_emb_kernel(
         mask_d
     )
 
-def fused_qk_attention(
-    q_nrope_absorb: torch.Tensor, 
-    q_rope: torch.Tensor, 
-    kv_latent_cache: torch.Tensor, 
-    k_rope_cache: torch.Tensor,
-    softmax_scale: float,
-    kernel_version: int = 1,
-    dtype: tl.constexpr = tl.float32,
-): 
+def fused_apply_rotary_emb(
+    x: torch.Tensor,
+    freq_cis: torch.Tensor
+):
+    B, L, H, D = x.shape
+    out = torch.empty((B, L, H, D), dtype=x.dtype, device=x.device)
 
-    B, L, H, K = q_nrope_absorb.shape
-    _, T, R = k_rope_cache.shape
-    out = torch.empty((B, L, H, T), dtype=q_nrope_absorb.dtype, device=q_nrope_absorb.device)
+    grid = lambda meta: (
+        B, # batch size
+        L, # seq_len_q
+        H, # num_heads
+    )
 
-    if kernel_version == 1:
-        grid = lambda meta: (
-            triton.cdiv(L, meta["BLOCK_L"]), 
-            triton.cdiv(T, meta["BLOCK_T"]),
-            B, # batch size
-        )
-        kernel_func = fused_qk_attention_kernel
-    elif kernel_version == 2:
-        grid = lambda meta: (
-            triton.cdiv(L, meta["BLOCK_L"]), 
-            triton.cdiv(T, meta["BLOCK_T"]),
-            B * H, # batch size * num_heads
-        )
-        kernel_func = fused_qk_attention_kernel_2
-
-    kernel_func[grid](
-        q_nrope_absorb,
-        q_rope,
-        kv_latent_cache,
-        k_rope_cache,
-        out,
-        B, L, H, K, R, T,
-        *q_nrope_absorb.stride(),
-        *q_rope.stride(),
-        *kv_latent_cache.stride(),
-        *k_rope_cache.stride(),
+    fused_apply_rotary_emb_kernel[grid](
+        x, freq_cis, out, 
+        B, L, H, D,
+        *x.stride(),
+        *freq_cis.stride(),
         *out.stride(),
-        softmax_scale, 
-        # BLOCK_L=32,
-        # BLOCK_T=32,
-        # BLOCK_K=32,
-        # BLOCK_R=32,
-        dtype=dtype,
-    ) # the block sizes is tuned by autotune
+        # BLOCK_D=32 # auto tune
+    )
 
     return out
+
+# =================== mask_softmax ========================
 
 @triton.autotune(
     configs=[
@@ -502,7 +532,7 @@ def fused_mask_softmax_kernel(
         row_max = tl.maximum(row_max, tl.max(tile, axis=0))
     
     # Second pass: Compute the sum of exp(x - max)
-    row_sum = 0.0
+    row_sum = tl.zeros((1,), dtype=tl.float32)
     for start in range(0, T, BLOCK_T):
         offs_t = start + offs
         mask_valid = offs_t < T
@@ -540,7 +570,6 @@ def fused_mask_softmax_kernel(
         exp_tile = tl.exp(tile)
         softmax_tile = exp_tile / row_sum
         tl.store(row_scores_ptr + offs_t * stride_scores_t, softmax_tile, mask=mask_valid)
-    
 
 def fused_mask_softmax(scores: torch.Tensor, mask: torch.Tensor):
     """
@@ -563,32 +592,24 @@ def fused_mask_softmax(scores: torch.Tensor, mask: torch.Tensor):
         # BLOCK_T will be automatically selected by autotune
     )
 
-def fused_apply_rotary_emb(
-    x: torch.Tensor,
-    freq_cis: torch.Tensor
-):
-    B, L, H, D = x.shape
-    out = torch.empty((B, L, H, D), dtype=x.dtype, device=x.device)
 
-    grid = lambda meta: (
-        B, # batch size
-        L, # seq_len_q
-        H, # num_heads
-    )
+# =================== rms_norm ========================
 
-    fused_apply_rotary_emb_kernel[grid](
-        x, freq_cis, out, 
-        B, L, H, D,
-        *x.stride(),
-        *freq_cis.stride(),
-        *out.stride(),
-        # BLOCK_D=32 # auto tune
-    )
-
-    return out
-
-DEFAULT_BLOCK_SIZE = 1024
-
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {
+                "BLOCK_SIZE": 512
+            }, num_warps=4
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE": 1024
+            }, num_warps=4
+        ),
+    ],
+    key=['normalized_dim'] # re-sesearch when changing these values
+)
 @triton.jit
 def _optimized_rms_norm_kernel(
     x_ptr, out_ptr, weight_ptr,
@@ -597,7 +618,7 @@ def _optimized_rms_norm_kernel(
     stride_out_batch, stride_out_dim,
     stride_weight,
     epsilon,
-    BLOCK_SIZE: tl.constexpr = DEFAULT_BLOCK_SIZE,
+    BLOCK_SIZE: tl.constexpr,
 ):
     """
     Every program deals with one row on the x (assuming the last dim as the dim to normalized) 
@@ -678,3 +699,88 @@ def fused_rms_norm(x, normalized_shape, weight, epsilon=1e-6):
     )
 
     return out
+
+# =================== page_cache_update ========================
+
+@triton.jit
+def page_cache_update_kernel(
+    kv_latent_ptr, # [B, T, K]
+    k_rope_ptr, # [B, T, R]
+    logical_to_physical_ptr, # (batch_size, max_logical_page)
+    kv_latent_pages_ptr, # (num_pages, page_size, kv_latent_rank) 
+    k_rope_latent_pages_ptr,
+    seq_len: tl.constexpr,
+    max_num_logical_page: tl.constexpr,
+    page_size: tl.constexpr,
+    kv_latent_rank: tl.constexpr,
+    qk_rope_head_dim: tl.constexpr,
+    start_pos: tl.constexpr,
+):
+    """
+    One thread process one kv_latent vector and one k_rope vector
+    """
+    batch_id = tl.program_id(0)
+    seq_id = tl.program_id(1)
+
+    logical_page_idx = seq_id // page_size
+    offset_in_page = seq_id % page_size
+
+    physical_page_idx_ptr = logical_to_physical_ptr + batch_id * max_num_logical_page + logical_page_idx
+    physical_page_idx = tl.load(physical_page_idx_ptr, mask=logical_page_idx < max_num_logical_page, other=-1)
+
+    kv_latent_src_ptr = kv_latent_ptr + (batch_id * seq_len + seq_id) * kv_latent_rank
+    kv_latent_dst_ptr = kv_latent_pages_ptr + physical_page_idx * page_size * kv_latent_rank + offset_in_page * kv_latent_rank
+
+    k_rope_src_ptr = k_rope_ptr + (batch_id * seq_len + seq_id) * qk_rope_head_dim
+    k_rope_dst_ptr = k_rope_latent_pages_ptr + physical_page_idx * page_size * qk_rope_head_dim + offset_in_page * qk_rope_head_dim
+
+    kv_latent_offsets = tl.arange(0, kv_latent_rank)
+    kv_latent_src_values = tl.load(kv_latent_src_ptr + kv_latent_offsets, mask=kv_latent_offsets < kv_latent_rank)
+    tl.store(kv_latent_dst_ptr + kv_latent_offsets, kv_latent_src_values, mask=kv_latent_offsets < kv_latent_rank)
+
+    k_rope_offsets = tl.arange(0, qk_rope_head_dim)
+    k_rope_src_values = tl.load(k_rope_src_ptr + k_rope_offsets, mask=k_rope_offsets < qk_rope_head_dim)
+    tl.store(k_rope_dst_ptr + k_rope_offsets, k_rope_src_values, mask=k_rope_offsets < qk_rope_head_dim)
+
+# =================== page_cache_retrieve ========================
+
+@triton.jit
+def page_cache_retrieve_kernel(
+    kv_latent_pages_ptr,
+    k_rope_pages_ptr,
+    logical_to_physical_ptr, # (batch_size, max_logical_page)
+    kv_latent_out_ptr, 
+    k_rope_out_ptr,
+    seq_len: tl.constexpr,
+    max_num_logical_page: tl.constexpr,
+    page_size: tl.constexpr,
+    kv_latent_rank: tl.constexpr,
+    qk_rope_head_dim: tl.constexpr,
+    start_pos: tl.constexpr,
+):
+    """
+    One thread process one kv_latent vector and one k_rope vector
+    """
+    batch_id = tl.program_id(0)
+    seq_id = tl.program_id(1)
+
+    logical_page_idx = seq_id // page_size
+    offset_in_page = seq_id % page_size
+
+    physical_page_idx_ptr = logical_to_physical_ptr + batch_id * max_num_logical_page + logical_page_idx
+    physical_page_idx = tl.load(physical_page_idx_ptr, mask=logical_page_idx < max_num_logical_page, other=-1)
+
+    # src is retrived from cache
+    kv_latent_src_ptr = kv_latent_pages_ptr + physical_page_idx * page_size * kv_latent_rank + offset_in_page * kv_latent_rank
+    kv_latent_dst_ptr = kv_latent_out_ptr + (batch_id * seq_len + seq_id) * kv_latent_rank
+
+    k_rope_src_ptr = k_rope_pages_ptr + physical_page_idx * page_size * qk_rope_head_dim + offset_in_page * qk_rope_head_dim
+    k_rope_dst_ptr = k_rope_out_ptr + (batch_id * seq_len + seq_id) * qk_rope_head_dim
+
+    kv_latent_offsets = tl.arange(0, kv_latent_rank)
+    kv_latent_src_values = tl.load(kv_latent_src_ptr + kv_latent_offsets, mask=kv_latent_offsets < kv_latent_rank)
+    tl.store(kv_latent_dst_ptr + kv_latent_offsets, kv_latent_src_values, mask=kv_latent_offsets < kv_latent_rank)
+
+    k_rope_offsets = tl.arange(0, qk_rope_head_dim)
+    k_rope_src_values = tl.load(k_rope_src_ptr + k_rope_offsets, mask=k_rope_offsets < qk_rope_head_dim)
+    tl.store(k_rope_dst_ptr + k_rope_offsets, k_rope_src_values, mask=k_rope_offsets < qk_rope_head_dim)
