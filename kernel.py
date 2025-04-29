@@ -401,7 +401,7 @@ def fused_apply_rotary_emb_kernel(
         mask_d
     )
 
-def fused_qk_attention(
+def fused_qk_attention_forward(
     q_nrope_absorb: torch.Tensor, 
     q_rope: torch.Tensor, 
     kv_latent_cache: torch.Tensor, 
@@ -452,21 +452,85 @@ def fused_qk_attention(
 
     return out
 
+class FusedQKAttentionFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q_nrope_absorb, q_rope, kv_latent_cache, k_rope_cache,
+                softmax_scale, kernel_version, dtype):
+        scores = fused_qk_attention_forward(
+            q_nrope_absorb, q_rope,
+            kv_latent_cache, k_rope_cache,
+            softmax_scale, kernel_version=kernel_version, dtype=dtype
+        )
+        
+        ctx.save_for_backward(q_nrope_absorb, q_rope, kv_latent_cache, k_rope_cache)
+        ctx.softmax_scale = softmax_scale
+        
+        return scores
+    
+    @staticmethod
+    def backward(ctx, grad_scores):
+        """
+        Backward pass: Computes gradients for the inputs.
+        dL/dQ_n = (dL/dScores * scale) @ K_l
+        dL/dK_l = Q_n.T @ (dL/dScores * scale)
+        dL/dQ_r = (dL/dScores * scale) @ K_r
+        dL/dK_r = Q_r.T @ (dL/dScores * scale)
+        """
+        # Retrieve saved tensors and parameters
+        q_nrope_absorb, q_rope, kv_latent_cache, k_rope_cache = ctx.saved_tensors
+        softmax_scale = ctx.softmax_scale
+
+        scaled_grad_scores = grad_scores * softmax_scale
+
+        grad_q_nrope_absorb = torch.einsum("blht,btk->blhk", scaled_grad_scores, kv_latent_cache)
+
+        grad_kv_latent_cache = torch.einsum("blhk,blht->btk", q_nrope_absorb, scaled_grad_scores)
+
+        grad_q_rope = torch.einsum("blht,btr->blhr", scaled_grad_scores, k_rope_cache)
+
+        grad_k_rope_cache = torch.einsum("blhr,blht->btr", q_rope, scaled_grad_scores)
+
+        return (
+            grad_q_nrope_absorb,
+            grad_q_rope,
+            grad_kv_latent_cache,
+            grad_k_rope_cache,
+            None,  # Gradient for softmax_scale
+            None,  # Gradient for kernel_version
+            None,  # Gradient for dtype
+        )
+        
+def fused_qk_attention(
+    q_nrope_absorb: torch.Tensor,
+    q_rope: torch.Tensor,
+    kv_latent_cache: torch.Tensor,
+    k_rope_cache: torch.Tensor,
+    softmax_scale: float,
+    kernel_version: int = 1,
+    dtype: tl.constexpr = tl.float16,
+):
+    return FusedQKAttentionFunction.apply(
+        q_nrope_absorb, q_rope, kv_latent_cache, k_rope_cache,
+        softmax_scale, kernel_version, dtype
+    )
+        
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_T": 128}, num_warps=4),
         triton.Config({"BLOCK_T": 64}, num_warps=4),
     ],
-    key=["T"]
+    key=["T"] # Autotune based on sequence length T
 )
 @triton.jit
-def fused_mask_softmax_kernel(
-    scores_ptr,         # pointer to scores, shape [B, L, H, T]
-    mask_ptr,           # pointer to mask, shape [1, L, 1, T]
-    B, L, H, T,         # dimensions of scores
+def fused_mask_softmax_kernel_out_of_place(
+    scores_ptr,
+    mask_ptr,
+    output_ptr,
+    B, L, H, T,
     stride_scores_b, stride_scores_l, stride_scores_h, stride_scores_t,
-    stride_mask_l, stride_mask_t,  # mask only uses strides of the l and t dimensions
-    BLOCK_T: tl.constexpr,          # number of elements processed in the T dimension per block
+    stride_mask_l, stride_mask_t,
+    stride_out_b, stride_out_l, stride_out_h, stride_out_t,
+    BLOCK_T: tl.constexpr,
 ):
     # Each program processes one row, corresponding to (b, l, h)
     pid = tl.program_id(0)
@@ -479,29 +543,31 @@ def fused_mask_softmax_kernel(
 
     # Starting address of the current row in scores
     row_scores_ptr = scores_ptr + b * stride_scores_b + l * stride_scores_l + h * stride_scores_h
+    
+    row_output_ptr = output_ptr + b * stride_out_b + l * stride_out_l + h * stride_out_h
 
-    # First pass: Scan the T dimension to compute the maximum value (for numerical stability)
-    row_max = -1e9  # Using a scalar to store the maximum value directly
+    # First Pass : Compute max
+    row_max = -float('inf') # Use float('inf') instead of 1e-9 for better generality
     offs = tl.arange(0, BLOCK_T)
     for start in range(0, T, BLOCK_T):
         offs_t = start + offs
         mask_valid = offs_t < T
-        # Load the scores tile
         scores_tile = tl.load(
             row_scores_ptr + offs_t * stride_scores_t,
             mask=mask_valid,
-            other=-1e9
+            other=-float('inf') # Use -inf
         )
-        # Load the corresponding mask tile (mask shape is [1, L, 1, T], so it only relates to the l and t dimensions)
         mask_tile = tl.load(
             mask_ptr + l * stride_mask_l + offs_t * stride_mask_t,
             mask=mask_valid,
             other=0.0
         )
         tile = scores_tile + mask_tile
-        row_max = tl.maximum(row_max, tl.max(tile, axis=0))
-    
-    # Second pass: Compute the sum of exp(x - max)
+        
+        current_max = tl.max(tl.where(mask_valid, tile, -float('inf')), axis=0)
+        row_max = tl.maximum(row_max, current_max)
+
+    # Second Pass: Compute sum
     row_sum = 0.0
     for start in range(0, T, BLOCK_T):
         offs_t = start + offs
@@ -509,7 +575,7 @@ def fused_mask_softmax_kernel(
         scores_tile = tl.load(
             row_scores_ptr + offs_t * stride_scores_t,
             mask=mask_valid,
-            other=-1e9
+            other=-float('inf') # changed from 1e-9
         )
         mask_tile = tl.load(
             mask_ptr + l * stride_mask_l + offs_t * stride_mask_t,
@@ -517,18 +583,20 @@ def fused_mask_softmax_kernel(
             other=0.0
         )
         tile = scores_tile + mask_tile
-        tile = tile - row_max
-        exp_tile = tl.exp(tile)
-        row_sum += tl.sum(exp_tile, axis=0)
-    
-    # Third pass: Normalize and write back to scores
+        # Subtract max for stability. Ensure invalid elements don't contribute to sum.
+        tile = tl.where(mask_valid, tile - row_max, -float('inf'))
+        exp_tile = tl.exp(tile) # exp(-inf) = 0
+        # Accumulate sum. Ensure only valid elements contribute.
+        row_sum += tl.sum(exp_tile, axis=0) # exp_tile is already 0 where mask_valid is false
+
+    # Third Pass: Normalize and write to OUTPUT
     for start in range(0, T, BLOCK_T):
         offs_t = start + offs
         mask_valid = offs_t < T
         scores_tile = tl.load(
             row_scores_ptr + offs_t * stride_scores_t,
             mask=mask_valid,
-            other=-1e9
+            other=-float('inf') # Or same value as in Pass 2
         )
         mask_tile = tl.load(
             mask_ptr + l * stride_mask_l + offs_t * stride_mask_t,
@@ -536,32 +604,75 @@ def fused_mask_softmax_kernel(
             other=0.0
         )
         tile = scores_tile + mask_tile
-        tile = tile - row_max
+        tile = tl.where(mask_valid, tile - row_max, -float('inf'))
         exp_tile = tl.exp(tile)
         softmax_tile = exp_tile / row_sum
-        tl.store(row_scores_ptr + offs_t * stride_scores_t, softmax_tile, mask=mask_valid)
+        tl.store(row_output_ptr + offs_t * stride_out_t, softmax_tile, mask=mask_valid)
     
-
-def fused_mask_softmax(scores: torch.Tensor, mask: torch.Tensor):
+def fused_mask_softmax_forward_out_of_place(scores: torch.Tensor, mask: torch.Tensor): # Renamed
     """
-    fused_mask_softmax: Apply mask to scores and perform softmax normalization along the last dimension.
-    scores: [B, L, H, T]
-    mask: [1, L, 1, T]
+    (Out-of-place version)
+    fused_mask_softmax: Apply mask to scores and perform softmax normalization
+                        along the last dimension, writing to a new tensor.
+    scores: [B, L, H, T] (Input)
+    mask: [1, L, 1, T] (Input)
+    Returns: [B, L, H, T] (Output - Softmax result)
     """
     B, L, H, T = scores.shape
-    # Get the strides for each dimension of scores
-    stride_scores_b, stride_scores_l, stride_scores_h, stride_scores_t = scores.stride()
-    # Mask's shape is [1, L, 1, T]; only the strides for l and t dimensions are used
-    _, stride_mask_l, _, stride_mask_t = mask.stride()
+    # Create the output tensor
+    # Ensure output tensor has the same dtype and device as scores
+    output = torch.empty_like(scores)
 
-    # Grid size: each block processes one row, i.e., one (b, l, h)
+    stride_scores_b, stride_scores_l, stride_scores_h, stride_scores_t = scores.stride()
+
+    _, stride_mask_l, _, stride_mask_t = mask.stride()
+    stride_out_b, stride_out_l, stride_out_h, stride_out_t = output.stride()
+
     grid = lambda meta: (B * L * H,)
-    fused_mask_softmax_kernel[grid](
-        scores, mask, B, L, H, T,
-        stride_scores_b, stride_scores_l, stride_scores_h, stride_scores_t,
-        stride_mask_l, stride_mask_t,
-        # BLOCK_T will be automatically selected by autotune
+
+    fused_mask_softmax_kernel_out_of_place[grid](
+        scores,         # Input scores
+        mask,           # Input mask
+        output,         # Output tensor
+        B, L, H, T,
+        stride_scores_b, stride_scores_l, stride_scores_h, stride_scores_t, # Input scores strides
+        stride_mask_l, stride_mask_t,                                       # Input mask strides
+        stride_out_b, stride_out_l, stride_out_h, stride_out_t,             # Output strides
+        # BLOCK_T is autotuned by the kernel decorator
     )
+    
+    return output
+    
+class FusedMaskSoftmaxFunction(torch.autograd.Function):
+    """
+    PyTorch autograd Function wrapper for the fused masked softmax Triton kernel.
+    Computes: output = softmax(scores + mask, dim=-1)
+    """
+
+    @staticmethod
+    def forward(ctx, scores, mask):
+        softmax_output = fused_mask_softmax_forward_out_of_place(scores, mask)
+        
+        ctx.save_for_backward(softmax_output)
+
+        return softmax_output
+
+    @staticmethod
+    def backward(ctx, grad_softmax_output):
+        """
+        Backward pass: Computes gradient for scores. Gradient for mask is None.
+        dL/dx = y * (dL/dy - sum(dL/dy * y)), where y = softmax(x)
+        Here x = scores + mask. Since d(scores+mask)/dscores = 1,
+        dL/dscores = dL/dx.
+        """
+        softmax_output, = ctx.saved_tensors
+        sum_term = torch.sum(grad_softmax_output * softmax_output, dim=-1, keepdim=True)
+        grad_scores = softmax_output * (grad_softmax_output - sum_term)
+
+        return grad_scores, None
+    
+def fused_mask_softmax(scores: torch.Tensor, mask: torch.Tensor):
+    return FusedMaskSoftmaxFunction.apply(scores, mask)
 
 def fused_apply_rotary_emb(
     x: torch.Tensor,
