@@ -10,6 +10,8 @@ An optimized PyTorch implementation of Multi-head Latent Attention (MLA) with Tr
 
 ## Key Features
 
+![ShallowMLA architecture](shallow_mla_fix.png)
+
 ### 1. Efficient MLA with Absorbed Weights
 Following DeepSeek-V3, we absorb KV up-projection weights into query projections, eliminating redundant upsampling operations. The latent KV cache (`c^KV_t`, `k^r_t`) is stored in compressed form, reducing memory footprint while maintaining model capacity.
 
